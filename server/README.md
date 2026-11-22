@@ -33,7 +33,15 @@ server\.venv\Scripts\python.exe -m pip install -r server\requirements-dev.txt
 python run_server.py
 # 等价于：
 # server\.venv\Scripts\python.exe -m uvicorn server.app.main:app --host 127.0.0.1 --port 8765
+
+# 后台运行（无控制台窗口；也可在项目根目录双击 start_server.vbs）
+python run_server.py --background
+python run_server.py --status
+python run_server.py --stop        # 或双击 stop_server.vbs
 ```
+
+后台模式的 PID 与日志位于 `server/data/server-<端口>.pid`、
+`server-<端口>.out.log` 与 `server-<端口>.err.log`。
 
 健康检查：`GET http://127.0.0.1:8765/api/v1/health` 返回
 `{"status": "ok", "version": "0.7.0"}`。

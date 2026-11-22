@@ -184,11 +184,20 @@
 # 终端 1：启动服务端（首次需安装 server 依赖）
 py -3 -m venv server\.venv
 server\.venv\Scripts\python.exe -m pip install -r server\requirements-dev.txt
-python run_server.py        # 或手动运行 uvicorn，见 server/README.md
+python run_server.py        # 前台运行，日志显示在当前终端
+
+# 或者后台运行（不弹出控制台窗口；也可直接双击 start_server.vbs）
+python run_server.py --background
+python run_server.py --status    # 查看是否在运行
+python run_server.py --stop      # 停止后台服务器（或双击 stop_server.vbs）
 
 # 终端 2：客户端
 .\.venv\Scripts\python.exe main.py
 ```
+
+后台模式通过 `pythonw.exe` + 脱离控制台启动，PID 写入
+`server/data/server-8765.pid`，日志写入
+`server/data/server-8765.out.log` 与 `server-8765.err.log`。
 
 客户端「联机对战」默认连接固定公网入口
 `wss://gomoku-host.taild407ad.ts.net:8443/api/v1/ws`（由 Tailscale Funnel
@@ -232,7 +241,9 @@ python run_server.py        # 或手动运行 uvicorn，见 server/README.md
 ```text
 Xiangqi/
 ├── main.py                       # 桌面入口
-├── run_server.py                 # 联机服务端启动脚本
+├── run_server.py                 # 联机服务端启动脚本（前台/后台/状态/停止）
+├── start_server.vbs              # 双击后台启动服务端（无控制台窗口）
+├── stop_server.vbs               # 双击停止后台服务端
 ├── xiangqi/
 │   ├── shared/                   # 纯 Python 领域层（禁止 import Qt）
 │   │   ├── rules.py              # 坐标、棋子、走法生成、将军/将死/困毙
