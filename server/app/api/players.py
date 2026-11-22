@@ -76,6 +76,15 @@ def create_router(
                         manager is not None
                         and manager.is_online(player.id)
                     ),
+                    "game_status": (
+                        manager.game_status_for(player.id)
+                        if manager is not None
+                        else ""
+                    ),
+                    "in_game": bool(
+                        manager is not None
+                        and manager.in_game(player.id)
+                    ),
                 }
             )
         return {"players": rows, "query": q.strip()}

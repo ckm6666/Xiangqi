@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QFrame,
@@ -37,6 +37,8 @@ class FriendsOverlay(ModalOverlay):
     profile_requested = Signal(str)
     #: 好友昵称、头像标识、是否在线
     chat_requested = Signal(str, str, bool)
+    #: 观战好友当前对局（参数为好友昵称）
+    spectate_requested = Signal(str)
 
     def __init__(
         self,
@@ -58,6 +60,12 @@ class FriendsOverlay(ModalOverlay):
         self._outgoing: list[dict] = []
         self._search_results: list[dict] = []
         self._search_query = ""
+        # 好友在线/对局状态会变化，窗口打开期间静默定时刷新。
+        self._auto_refresh = QTimer(self)
+        self._auto_refresh.setInterval(5000)
+        self._auto_refresh.timeout.connect(
+            lambda: self._refresh(silent=True)
+        )
 
         self._api.friends_loaded.connect(self._on_loaded)
         self._api.search_loaded.connect(self._on_search_loaded)
@@ -103,7 +111,9 @@ class FriendsOverlay(ModalOverlay):
         self.refresh_button = QPushButton("刷新", card)
         self.refresh_button.setObjectName("smallButton")
         self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.refresh_button.clicked.connect(self._refresh)
+        self.refresh_button.clicked.connect(
+            lambda _checked=False: self._refresh()
+        )
         header.addWidget(
             self.refresh_button, 0, Qt.AlignmentFlag.AlignTop
         )
@@ -168,6 +178,11 @@ class FriendsOverlay(ModalOverlay):
             height = min(640, max(480, host.height() - 36))
             self.card.setFixedSize(width, height)
         super().show_overlay()
+        self._auto_refresh.start()
+
+    def hide_overlay(self) -> None:
+        self._auto_refresh.stop()
+        super().hide_overlay()
 
     def refresh(self) -> None:
         """重新读取好友与申请（也供资料窗口关闭后自动刷新）。"""
@@ -179,8 +194,13 @@ class FriendsOverlay(ModalOverlay):
                 self._search_query,
             )
 
-    def _refresh(self) -> None:
-        self._set_status("正在读取好友列表…")
+    def set_status(self, text: str, error: bool = False) -> None:
+        """供主窗口在操作失败时设置状态文字。"""
+        self._set_status(text, error)
+
+    def _refresh(self, *, silent: bool = False) -> None:
+        if not silent:
+            self._set_status("正在读取好友列表…")
         self._api.fetch_friends(self._base_url, self._token)
 
     # ------------------------------------------------------------------
@@ -332,6 +352,10 @@ class FriendsOverlay(ModalOverlay):
         nickname = str(player.get("nickname", "棋友"))
         avatar_id = str(player.get("avatar", "default:1"))
         online = bool(player.get("online"))
+        game_status = str(player.get("game_status", ""))
+        in_game = bool(player.get("in_game")) or (
+            game_status == "playing"
+        )
         try:
             unread = int(player.get("unread", 0) or 0)
         except (TypeError, ValueError):
@@ -381,9 +405,14 @@ class FriendsOverlay(ModalOverlay):
         text_col.addWidget(name_label)
         text_col.addWidget(info_label)
         if friends or search:
-            presence = QLabel(
-                "● 在线" if online else "○ 离线", row
-            )
+            presence_text = "● 在线" if online else "○ 离线"
+            if game_status == "playing":
+                presence_text += " · 对局中"
+            elif game_status == "waiting":
+                presence_text += " · 等待对手"
+            elif online:
+                presence_text += " · 空闲"
+            presence = QLabel(presence_text, row)
             presence.setObjectName("friendPresence")
             presence.setProperty(
                 "online", "true" if online else "false"
@@ -396,6 +425,21 @@ class FriendsOverlay(ModalOverlay):
             badge = QLabel(f"{unread} 条未读", row)
             badge.setObjectName("friendUnread")
             layout.addWidget(badge)
+        if friends:
+            spectate = QPushButton("观战", row)
+            spectate.setObjectName("socialPrimaryButton")
+            spectate.setCursor(Qt.CursorShape.PointingHandCursor)
+            spectate.setMinimumHeight(30)
+            spectate.setEnabled(in_game)
+            spectate.setToolTip(
+                "" if in_game else "好友当前不在对局中"
+            )
+            spectate.clicked.connect(
+                lambda _checked=False, name=nickname: (
+                    self.spectate_requested.emit(name)
+                )
+            )
+            layout.addWidget(spectate)
         if incoming:
             accept = QPushButton("同意", row)
             accept.setObjectName("friendAcceptButton")

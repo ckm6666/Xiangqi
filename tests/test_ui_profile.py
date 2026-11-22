@@ -422,7 +422,7 @@ class FriendsOverlayTests(unittest.TestCase):
             label.text()
             for label in self.overlay.findChildren(QLabel)
         }
-        self.assertIn("● 在线", labels)
+        self.assertIn("● 在线 · 空闲", labels)
         self.assertIn("2 条未读", labels)
         chat_buttons = [
             button
@@ -434,6 +434,56 @@ class FriendsOverlayTests(unittest.TestCase):
         self.assertEqual(
             events, [("好友甲", "default:2", True)]
         )
+
+    def test_spectate_button_only_enabled_in_game(self) -> None:
+        requested: list[str] = []
+        self.overlay.spectate_requested.connect(requested.append)
+        self.overlay._on_loaded(
+            {
+                "friends": [
+                    {
+                        "nickname": "对局中",
+                        "rating": 1200,
+                        "title": "棋士",
+                        "avatar": "default:1",
+                        "online": True,
+                        "in_game": True,
+                        "game_status": "playing",
+                    },
+                    {
+                        "nickname": "空闲",
+                        "rating": 1200,
+                        "title": "棋士",
+                        "avatar": "default:2",
+                        "online": True,
+                        "in_game": False,
+                        "game_status": "",
+                    },
+                ],
+                "incoming": [],
+                "outgoing": [],
+            }
+        )
+        labels = {
+            label.text()
+            for label in self.overlay.findChildren(QLabel)
+        }
+        self.assertIn("● 在线 · 对局中", labels)
+        self.assertIn("● 在线 · 空闲", labels)
+
+        spectate_buttons = [
+            button
+            for button in self.overlay.findChildren(QPushButton)
+            if button.text() == "观战"
+        ]
+        self.assertEqual(len(spectate_buttons), 2)
+        enabled = [
+            button.isEnabled() for button in spectate_buttons
+        ]
+        self.assertEqual(enabled, [True, False])
+        spectate_buttons[0].click()
+        spectate_buttons[1].click()
+        self.assertEqual(requested, ["对局中"])
 
     def test_search_players_and_open_profile(self) -> None:
         requested: list[str] = []

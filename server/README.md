@@ -16,6 +16,8 @@
 - 好友私聊：消息持久化在 SQLite，支持历史、未读/已读和 WebSocket
   实时推送；好友列表返回在线状态与未读数；
 - 对局聊天：表情/快捷评论/文本由服务端校验、限流后广播给对局双方；
+- 好友观战：好友列表返回在线/对局状态；观战连接实时接收权威快照，
+  不参与走子、聊天、结算与房间在线状态；
 - 服务器权威走子：客户端只发送 `move_intent`，由服务端复用
   `xiangqi.shared.game_model.GameModel` 校验并广播完整 `game_state`；
   `game_state.moves` 携带完整着法历史供客户端棋谱复盘；
@@ -23,7 +25,7 @@
 - 认输、双方同意的再来一局；
 - 断线状态展示与同账号重连。
 
-尚未实现：观战、每步时钟与超时判负、聊天。房间在进程内存中；
+尚未实现：每步时钟与超时判负。房间在进程内存中；
 登录令牌保存在服务端内存，有效期 24 小时，服务端重启后需重新登录。
 本实现面向本地/局域网娱乐，不是公网生产级认证系统。
 
@@ -80,8 +82,9 @@ python run_server.py --stop        # 或双击 stop_server.vbs
   `GET /api/v1/profile/avatar/{昵称}`）：公开读取自定义头像 PNG；
   内置头像返回 404，由客户端本地绘制。
 - `GET /api/v1/profile/friends`：返回 `friends`（好友）、`incoming`
-  （收到的申请）、`outgoing`（我发出的申请）；好友项附带 `online`
-  与未读私聊数 `unread`。
+  （收到的申请）、`outgoing`（我发出的申请）；好友项附带 `online`、
+  未读私聊数 `unread`、`game_status`（`playing` / `waiting` / 空）与
+  `in_game`。
 - `POST /api/v1/profile/friends`：`{"nickname": "棋友"}` 发送好友申请；
   若对方已先申请则直接成为好友。
 - `POST /api/v1/profile/friends/accept` / `decline`：
@@ -142,7 +145,7 @@ server/
 │   ├── api/deps.py      # Bearer 令牌依赖
 │   └── ws/
 │       ├── endpoint.py  # /api/v1/ws 收发循环、令牌认证
-│       └── rooms.py     # RoomManager：房间、排位、战绩、权威走子、悔棋
+│       └── rooms.py     # RoomManager：房间、排位、战绩、权威走子、悔棋、观战
 ├── data/xiangqi.db      # 运行期账号数据库（不提交）
 ├── tests/test_online.py
 ├── requirements.txt
@@ -180,6 +183,7 @@ server/
 | C→S | `undo_response` | `{"accept": true}` |
 | C→S | `resign` / `rematch` / `leave` | 空；排队中发送 `leave` 即取消匹配 |
 | C→S | `chat` | `{"kind": "emoji"\|"text", "content": "..."}`（对局内） |
+| C→S | `spectate` | `{"nickname": "好友"}`（仅限好友且对方正在对局） |
 | S→C | `auth_ok` | `{"user_id", "nickname", "rating"}` |
 | S→C | `game_state` | 房间、双方、棋盘、行棋方、终局、悔棋/再战、排位信息 |
 | S→C | `queue_status` | `{"message", "position", "queued", "rating"}` |
@@ -192,6 +196,7 @@ server/
 | S→C | `challenge_cancelled` | `{"challenge_id", "reason"}` |
 | S→C | `chat_message` | `{"kind", "content", "sender_id", "sender_name", "sent_at_ms"}` |
 | S→C | `direct_message` | `{"id", "sender_id", "sender_name", "recipient_id", "content", "sent_at_ms"}` |
+| S→C | `spectate_ended` | `{"reason"}`（房间关闭时通知观战者） |
 | S→C | `error` | `{"message"}`（发言被拒时带 `request_id`） |
 
 `game_state` 关键字段：
@@ -201,7 +206,8 @@ server/
   "room_code": "WXYZ",
   "status": "waiting | playing | finished",
   "ranked": true,
-  "your_side": "red | black",
+  "your_side": "red | black | null",
+  "spectator": false,
   "players": {
     "red": {
       "name": "...", "connected": true,
@@ -251,7 +257,8 @@ server\.venv\Scripts\python.exe -m unittest server.tests.test_online -v
 排位队列配对/取消/出队、Elo 加减分与持久化、再战清除加减分，以及
 个人资料、战绩、成就、默认/自定义头像、好友申请/同意/拒绝、昵称搜索、
 排行榜（包含尚无对局的新账号）、玩家资料、自建房邀请与挑战接受/拒绝、
-对局表情/评论广播与限流、好友私聊持久化/未读/已读/实时推送。
+对局表情/评论广播与限流、好友私聊持久化/未读/已读/实时推送、
+好友对局状态与观战只读快照。
 
 ## 已知限制
 
@@ -259,5 +266,5 @@ server\.venv\Scripts\python.exe -m unittest server.tests.test_online -v
   `server/data/xiangqi.db`；对局聊天不落库；
 - 登录令牌保存在进程内存，24 小时有效，服务端重启后需重新登录；
 - 断线后房间保留以便同账号重连，但双方都断开后房间删除；
-- 无每步时钟、超时判负与观战；
+- 无每步时钟与超时判负；
 - 协议仍为 v1，后续加入时钟等能力时会保持向后兼容或升级版本。

@@ -57,11 +57,14 @@ def friend_entry(
     *,
     online: bool = False,
     unread: int = 0,
+    game_status: str = "",
 ) -> dict[str, object]:
-    """好友列表条目：附带在线状态与未读私聊数。"""
+    """好友列表条目：附带在线状态、对局状态与未读私聊数。"""
     payload = friend_payload(friend)
     payload["online"] = bool(online)
     payload["unread"] = int(unread)
+    payload["game_status"] = game_status
+    payload["in_game"] = game_status == "playing"
     return payload
 
 
@@ -212,6 +215,11 @@ def create_router(
                         else False
                     ),
                     unread=unread.get(friend.id, 0),
+                    game_status=(
+                        manager.game_status_for(friend.id)
+                        if manager is not None
+                        else ""
+                    ),
                 )
                 for friend in users.list_friends(user.id)
             ],

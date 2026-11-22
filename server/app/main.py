@@ -4,8 +4,8 @@
 
     server\\.venv\\Scripts\\python.exe -m uvicorn server.app.main:app --port 8765
 
-0.7.0 提供 SQLite 账号、排位、战绩、头像、好友、私聊与对局聊天，以及
-REST 登录注册、资料与私聊接口。账号、排位分与私聊持久化在
+0.7.0 提供 SQLite 账号、排位、战绩、头像、好友、私聊、对局聊天与观战，
+以及 REST 登录注册、资料与私聊接口。账号、排位分与私聊持久化在
 server/data/xiangqi.db；登录令牌保存在内存中。
 """
 

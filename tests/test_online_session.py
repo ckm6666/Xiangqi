@@ -14,6 +14,7 @@ from xiangqi.client.sessions.online import (  # noqa: E402
     ACTION_JOIN,
     ACTION_LOBBY,
     ACTION_QUEUE,
+    ACTION_SPECTATE,
     OnlineGameSession,
     STATUS_DISCONNECTED,
     STATUS_FINISHED,
@@ -32,6 +33,7 @@ from xiangqi.shared.protocol import (  # noqa: E402
     SERVER_MOVE_REJECTED,
     SERVER_QUEUE_STATUS,
     SERVER_REMATCH_REQUESTED,
+    SERVER_SPECTATE_ENDED,
     SERVER_UNDO_REQUESTED,
     SERVER_UNDO_RESULT,
     make_message,
@@ -43,7 +45,7 @@ from xiangqi.shared.rules import Side  # noqa: E402
 def snapshot(
     *,
     status: str = STATUS_PLAYING,
-    your_side: str = "red",
+    your_side: str | None = "red",
     side_to_move: str = "red",
     move_count: int = 0,
     red: tuple[str, bool] = ("红方", True),
@@ -60,12 +62,14 @@ def snapshot(
     black_rating: int = 1200,
     red_delta: int | None = None,
     black_delta: int | None = None,
+    spectator: bool = False,
 ) -> dict:
     payload = {
         "room_code": "ABCD",
         "status": status,
         "ranked": ranked,
         "your_side": your_side,
+        "spectator": spectator,
         "players": {
             "red": {
                 "name": red[0],
@@ -99,13 +103,16 @@ def snapshot(
 class OnlineSessionTests(unittest.TestCase):
     """创建/加入、权威快照、悔棋、认输与再战。"""
 
-    def _make_session(self, action=ACTION_CREATE, code=None):
+    def _make_session(
+        self, action=ACTION_CREATE, code=None, target_name=None
+    ):
         transport = FakeTransport()
         session = OnlineGameSession(
             transport,
             token="test-token",
             action=action,
             room_code=code,
+            target_name=target_name,
         )
         session.connect_to("ws://localhost:8000/api/v1/ws")
         return transport, session
@@ -593,6 +600,45 @@ class OnlineSessionTests(unittest.TestCase):
             )
         )
         self.assertTrue(results[-1][0])
+
+    def test_spectate_flow_is_read_only(self) -> None:
+        transport, session = self._make_session(
+            action=ACTION_SPECTATE, target_name="好友甲"
+        )
+        ready: list[bool] = []
+        ended: list[str] = []
+        session.room_ready.connect(lambda: ready.append(True))
+        session.spectate_ended.connect(ended.append)
+        self._connect(transport)
+        sent = transport.sent[-1]
+        self.assertEqual(sent["type"], "spectate")
+        self.assertEqual(sent["payload"]["nickname"], "好友甲")
+        self.assertTrue(session.spectating)
+
+        self._apply(
+            transport,
+            snapshot(
+                your_side=None,
+                red=("好友甲", True),
+                black=("对手乙", True),
+                spectator=True,
+            ),
+        )
+        self.assertTrue(ready)
+        self.assertTrue(session.spectating)
+        self.assertIsNone(session.human_side)
+        self.assertFalse(session.accepts_human_input)
+        self.assertFalse(session.chat_available)
+        self.assertFalse(session.can_undo)
+        self.assertFalse(session.request_resign())
+        self.assertFalse(session.request_restart())
+
+        transport.server_send(
+            make_message(
+                SERVER_SPECTATE_ENDED, {"reason": "对局已结束"}
+            )
+        )
+        self.assertEqual(ended, ["对局已结束"])
 
     def test_room_ready_emitted_once(self) -> None:
         transport, session = self._make_session()

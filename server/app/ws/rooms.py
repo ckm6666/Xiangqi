@@ -40,6 +40,7 @@ from xiangqi.shared.protocol import (
     CLIENT_MOVE_INTENT,
     CLIENT_REMATCH,
     CLIENT_RESIGN,
+    CLIENT_SPECTATE,
     CLIENT_UNDO_REQUEST,
     CLIENT_UNDO_RESPONSE,
     SERVER_CHALLENGE,
@@ -51,6 +52,7 @@ from xiangqi.shared.protocol import (
     SERVER_MOVE_REJECTED,
     SERVER_QUEUE_STATUS,
     SERVER_REMATCH_REQUESTED,
+    SERVER_SPECTATE_ENDED,
     SERVER_UNDO_REQUESTED,
     SERVER_UNDO_RESULT,
     make_message,
@@ -89,6 +91,7 @@ class Connection:
     rating: int = DEFAULT_RATING
     room_code: Optional[str] = None
     side: Optional[Side] = None
+    spectating: bool = False
 
 
 @dataclass
@@ -130,6 +133,8 @@ class Room:
     )
     undo_requester: Optional[Side] = None
     rematch_requests: set[Side] = field(default_factory=set)
+    #: 观战连接（账号 id -> 连接），不参与走子、结算与房间在线状态。
+    spectators: dict[int, Connection] = field(default_factory=dict)
     ranked: bool = False
     rated: bool = False
     result_recorded: bool = False
@@ -204,6 +209,8 @@ class RoomManager:
                 await self.invite_friend(conn, payload)
             elif message_type == CLIENT_CHALLENGE_RESPONSE:
                 await self.challenge_response(conn, payload)
+            elif message_type == CLIENT_SPECTATE:
+                await self.spectate(conn, payload)
             elif conn.room_code is None:
                 raise RoomError("请先创建或加入房间")
             elif message_type == CLIENT_MOVE_INTENT:
@@ -352,6 +359,94 @@ class RoomManager:
 
         self.queue.remove(candidate)
         await self._create_ranked_room(candidate, conn)
+
+    def game_status_for(self, user_id: int) -> str:
+        """返回玩家当前所在房间的状态：playing / waiting / 空字符串。"""
+        waiting = ""
+        # REST 好友/搜索接口在线程池中执行，这里先复制房间列表，避免与
+        # 事件循环里的建房/删房并发迭代时触发字典变更错误。
+        for room in list(self.rooms.values()):
+            if user_id not in room.user_ids.values():
+                continue
+            if room.status == ROOM_STATUS_PLAYING:
+                return ROOM_STATUS_PLAYING
+            if room.status == ROOM_STATUS_WAITING:
+                waiting = ROOM_STATUS_WAITING
+        return waiting
+
+    def in_game(self, user_id: int) -> bool:
+        """玩家是否正在一局进行中的对局里。"""
+        return self.game_status_for(user_id) == ROOM_STATUS_PLAYING
+
+    async def spectate(
+        self,
+        conn: Connection,
+        payload: Mapping[str, object],
+    ) -> None:
+        """加入好友当前对局的观战；只收快照，不参与走子与结算。"""
+        user = self._require_user(conn)
+        nickname = payload.get("nickname")
+        if not isinstance(nickname, str) or not nickname.strip():
+            raise RoomError("请选择要观战的好友")
+        target = self.users.find_by_nickname(nickname)
+        if target is None:
+            raise RoomError("玩家不存在")
+        if target.id == user.id:
+            raise RoomError("不能观战自己")
+        if self.users.relationship(user.id, target.id) != "friend":
+            raise RoomError("只能观战好友的对局")
+        if conn.room_code is not None or conn.spectating:
+            raise RoomError("请先离开当前房间")
+
+        room: Optional[Room] = None
+        for candidate in self.rooms.values():
+            if (
+                candidate.status == ROOM_STATUS_PLAYING
+                and target.id in candidate.user_ids.values()
+            ):
+                room = candidate
+                break
+        if room is None:
+            raise RoomError("好友当前不在对局中")
+        if user.id in room.user_ids.values():
+            raise RoomError("不能观战自己参与的对局")
+
+        async with room.lock:
+            if (
+                room.status != ROOM_STATUS_PLAYING
+                or target.id not in room.user_ids.values()
+            ):
+                raise RoomError("好友当前不在对局中")
+            if user.id in room.spectators:
+                raise RoomError("你已经在观战该对局")
+            room.spectators[user.id] = conn
+            conn.name = user.nickname
+            conn.rating = user.rating
+            conn.room_code = room.code
+            conn.side = None
+            conn.spectating = True
+            await self._send_ws(
+                conn.websocket,
+                make_message(
+                    SERVER_GAME_STATE,
+                    self._snapshot(room, None, spectator=True),
+                ),
+            )
+
+    async def _end_spectators(
+        self, room: Room, reason: str
+    ) -> None:
+        """房间关闭时通知并断开所有观战连接。"""
+        if not room.spectators:
+            return
+        message = make_message(
+            SERVER_SPECTATE_ENDED, {"reason": reason}
+        )
+        for spectator in list(room.spectators.values()):
+            await self._send_ws(spectator.websocket, message)
+            spectator.room_code = None
+            spectator.spectating = False
+        room.spectators.clear()
 
     async def _create_ranked_room(
         self,
@@ -702,6 +797,13 @@ class RoomManager:
             return
 
         async with room.lock:
+            if conn.spectating:
+                conn.spectating = False
+                room.spectators.pop(conn.user_id or 0, None)
+                if not any(room.connected.values()) and not room.spectators:
+                    self.rooms.pop(code, None)
+                return
+
             side = conn.side
             conn.side = None
             if side is None:
@@ -720,6 +822,7 @@ class RoomManager:
             room.version += 1
             await self._broadcast_state(room)
             if not any(room.connected.values()):
+                await self._end_spectators(room, "对局已结束")
                 self.rooms.pop(code, None)
 
     # ------------------------------------------------------------------
@@ -968,12 +1071,19 @@ class RoomManager:
     # ------------------------------------------------------------------
     # 快照与发送
     # ------------------------------------------------------------------
-    def _snapshot(self, room: Room, side: Side) -> dict[str, object]:
+    def _snapshot(
+        self,
+        room: Room,
+        side: Optional[Side],
+        *,
+        spectator: bool = False,
+    ) -> dict[str, object]:
         game = room.game
         return {
             "room_code": room.code,
             "status": room.status,
-            "your_side": side.value,
+            "your_side": side.value if side is not None else None,
+            "spectator": spectator,
             "ranked": room.ranked,
             "players": {
                 "red": {
@@ -1017,6 +1127,13 @@ class RoomManager:
     async def _broadcast_state(self, room: Room) -> None:
         for side in (Side.RED, Side.BLACK):
             await self._send_state(room, side)
+        if room.spectators:
+            message = make_message(
+                SERVER_GAME_STATE,
+                self._snapshot(room, None, spectator=True),
+            )
+            for spectator in list(room.spectators.values()):
+                await self._send_ws(spectator.websocket, message)
 
     async def _send_state(self, room: Room, side: Side) -> None:
         websocket = room.websockets[side]

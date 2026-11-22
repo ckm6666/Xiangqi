@@ -44,6 +44,7 @@ CLIENT_LEAVE = "leave"
 CLIENT_INVITE_FRIEND = "invite_friend"
 CLIENT_CHALLENGE_RESPONSE = "challenge_response"
 CLIENT_CHAT = "chat"
+CLIENT_SPECTATE = "spectate"
 
 # 服务端 → 客户端
 SERVER_AUTH_OK = "auth_ok"
@@ -59,6 +60,7 @@ SERVER_CHALLENGE = "challenge"
 SERVER_CHALLENGE_CANCELLED = "challenge_cancelled"
 SERVER_CHAT = "chat_message"
 SERVER_DIRECT_MESSAGE = "direct_message"
+SERVER_SPECTATE_ENDED = "spectate_ended"
 
 MESSAGE_TYPES = frozenset(
     {
@@ -75,6 +77,7 @@ MESSAGE_TYPES = frozenset(
         CLIENT_INVITE_FRIEND,
         CLIENT_CHALLENGE_RESPONSE,
         CLIENT_CHAT,
+        CLIENT_SPECTATE,
         SERVER_AUTH_OK,
         SERVER_GAME_STATE,
         SERVER_QUEUE_STATUS,
@@ -88,6 +91,7 @@ MESSAGE_TYPES = frozenset(
         SERVER_CHALLENGE_CANCELLED,
         SERVER_CHAT,
         SERVER_DIRECT_MESSAGE,
+        SERVER_SPECTATE_ENDED,
     }
 )
 
@@ -270,6 +274,7 @@ __all__ = [
     "CLIENT_INVITE_FRIEND",
     "CLIENT_CHALLENGE_RESPONSE",
     "CLIENT_CHAT",
+    "CLIENT_SPECTATE",
     "SERVER_AUTH_OK",
     "SERVER_GAME_STATE",
     "SERVER_QUEUE_STATUS",
@@ -283,6 +288,7 @@ __all__ = [
     "SERVER_CHALLENGE_CANCELLED",
     "SERVER_CHAT",
     "SERVER_DIRECT_MESSAGE",
+    "SERVER_SPECTATE_ENDED",
     "make_message",
     "parse_message",
     "serialize_board",

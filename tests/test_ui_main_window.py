@@ -675,6 +675,147 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(self.window.chat_bar.isHidden())
         self.assertTrue(self.window.chat_log.isHidden())
 
+    def _enter_spectate_game(
+        self, nickname: str = "好友甲"
+    ) -> FakeTransport:
+        self.window.online_button.click()
+        self.window.online_page.apply_auth("token", "甲", 1200)
+        self.assertTrue(
+            self.window.online_page.start_spectate(nickname)
+        )
+        transport = self.online_transports[-1]
+        transport.simulate_connected()
+        transport.server_send(
+            make_message(SERVER_AUTH_OK, AUTH_OK_PAYLOAD)
+        )
+        self.assertEqual(transport.sent[-1]["type"], "spectate")
+        self.assertEqual(
+            transport.sent[-1]["payload"]["nickname"], nickname
+        )
+        transport.server_send(
+            make_message(
+                SERVER_GAME_STATE,
+                online_state(
+                    your_side=None,
+                    spectator=True,
+                    players={
+                        "red": {
+                            "name": nickname,
+                            "connected": True,
+                        },
+                        "black": {
+                            "name": "对手乙",
+                            "connected": True,
+                        },
+                    },
+                ),
+            )
+        )
+        return transport
+
+    def test_spectate_ui_is_read_only(self) -> None:
+        transport = self._enter_spectate_game()
+        self.assertIs(
+            self.window.stack.currentWidget(), self.window.game_page
+        )
+        self.assertTrue(self.window.session.spectating)
+        self.assertEqual(self.window.local_mode_label.text(), "观战")
+        self.assertEqual(
+            self.window.turn_pill.text(), "观战 · 红方行棋"
+        )
+        self.assertEqual(
+            self.window.menu_back_button.text(), "离开观战"
+        )
+        self.assertTrue(self.window.undo_button.isHidden())
+        self.assertTrue(self.window.restart_button.isHidden())
+        self.assertTrue(self.window.chat_bar.isHidden())
+        self.assertFalse(
+            self.window.board_widget._interaction_enabled
+        )
+        self.assertIn("观战", self.window.move_label.text())
+
+        moved = GameModel.initial()
+        self.assertIsNotNone(moved.apply_move(6, 0, 5, 0))
+        transport.server_send(
+            make_message(
+                SERVER_GAME_STATE,
+                online_state(
+                    your_side=None,
+                    spectator=True,
+                    board=moved.board,
+                    side_to_move="black",
+                    move_count=1,
+                    last_move={
+                        "from_row": 6,
+                        "from_col": 0,
+                        "to_row": 5,
+                        "to_col": 0,
+                    },
+                    players={
+                        "red": {
+                            "name": "好友甲",
+                            "connected": True,
+                        },
+                        "black": {
+                            "name": "对手乙",
+                            "connected": True,
+                        },
+                    },
+                ),
+            )
+        )
+        self.assertEqual(
+            self.window.turn_pill.text(), "观战 · 黑方行棋"
+        )
+        self.assertIn("第 1 手", self.window.move_label.text())
+
+        transport.server_send(
+            make_message(
+                SERVER_GAME_STATE,
+                online_state(
+                    status="finished",
+                    your_side=None,
+                    spectator=True,
+                    winner="red",
+                    end_reason="checkmate",
+                    move_count=3,
+                    players={
+                        "red": {
+                            "name": "好友甲",
+                            "connected": True,
+                        },
+                        "black": {
+                            "name": "对手乙",
+                            "connected": True,
+                        },
+                    },
+                ),
+            )
+        )
+        self.window._result_timer.stop()
+        presentation = self.window._build_result_presentation(
+            self.window.session.view
+        )
+        self.assertEqual(presentation.title, "红方胜")
+        self.assertEqual(presentation.primary_text, "继续观战")
+
+        self.window.show_main_menu()
+        self.assertIs(
+            self.window.stack.currentWidget(),
+            self.window.online_page,
+        )
+
+    def test_spectate_ended_returns_to_lobby(self) -> None:
+        self._enter_spectate_game()
+        QTimer.singleShot(
+            0, lambda: self.window.active_modal().accept()
+        )
+        self.window._on_spectate_ended("房间已关闭")
+        self.assertIs(
+            self.window.stack.currentWidget(),
+            self.window.online_page,
+        )
+
     def test_online_waiting_room(self) -> None:
         self.window.online_button.click()
         self.window.online_page.apply_auth("token", "甲", 1200)
@@ -1140,6 +1281,7 @@ class MainWindowTests(unittest.TestCase):
         class FakeOverlay(QObject):
             profile_requested = Signal(str)
             chat_requested = Signal(str, str, bool)
+            spectate_requested = Signal(str)
 
             def __init__(self, *args, **kwargs) -> None:
                 del args, kwargs

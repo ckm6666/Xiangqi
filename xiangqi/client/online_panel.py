@@ -36,6 +36,7 @@ from xiangqi.client.sessions.online import (
     ACTION_CREATE,
     ACTION_LOBBY,
     ACTION_QUEUE,
+    ACTION_SPECTATE,
     OnlineGameSession,
 )
 from xiangqi.client.sound_control import SoundButton
@@ -91,6 +92,7 @@ class OnlinePanel(InkBackdrop):
         self._profile_info: dict = {}
         self._ws_url = ""
         self._pending_ws_url = ""
+        self._pending_action = ""
         # 大厅监听连接与对局连接都会收到同一条私聊，按消息 id 去重。
         self._seen_direct_ids: set[str] = set()
 
@@ -702,6 +704,15 @@ class OnlinePanel(InkBackdrop):
     def _on_create(self) -> None:
         self._start(ACTION_CREATE)
 
+    def start_spectate(self, nickname: str) -> bool:
+        """开始观战好友当前的对局。"""
+        if not nickname or not nickname.strip():
+            self._set_status("请选择要观战的好友", True)
+            return False
+        return self._start(
+            ACTION_SPECTATE, target_name=nickname.strip()
+        )
+
     def _on_ranked(self) -> None:
         if self._session is not None or self._busy:
             return
@@ -716,6 +727,7 @@ class OnlinePanel(InkBackdrop):
             return
         self._session = None
         self._queued = False
+        self._pending_action = ""
         try:
             session.cancel_queue()
         finally:
@@ -729,7 +741,12 @@ class OnlinePanel(InkBackdrop):
         self.reset()
         self.back_requested.emit()
 
-    def _start(self, action: str) -> bool:
+    def _start(
+        self,
+        action: str,
+        *,
+        target_name: str = "",
+    ) -> bool:
         if self._session is not None or self._busy:
             return False
         if not self._token:
@@ -743,13 +760,19 @@ class OnlinePanel(InkBackdrop):
 
         self._ensure_lobby()
         self._set_busy(True)
-        self._set_status("正在连接服务器…")
+        self._pending_action = action
+        self._set_status(
+            f"正在连接观战：{target_name}…"
+            if action == ACTION_SPECTATE
+            else "正在连接服务器…"
+        )
         transport = self._transport_factory(self)
         session = OnlineGameSession(
             transport,
             token=self._token,
             action=action,
             parent=None,
+            target_name=target_name,
         )
         # 传输层随会话一起销毁，取消匹配/连接失败时不残留子对象。
         set_parent = getattr(transport, "setParent", None)
@@ -794,9 +817,14 @@ class OnlinePanel(InkBackdrop):
             return
         self._session = None
         self._queued = False
+        self._pending_action = ""
         self._set_busy(False)
         self._sync_queue_controls()
-        self._set_status("对局已连接")
+        self._set_status(
+            "观战已连接"
+            if session.spectating
+            else "对局已连接"
+        )
         self.session_ready.emit(session)
 
     def _on_queue_status(
@@ -822,13 +850,20 @@ class OnlinePanel(InkBackdrop):
             return
         if source is not None and source is not session:
             return
+        failed_spectate = self._pending_action == ACTION_SPECTATE
+        self._pending_action = ""
         self._session = None
         self._queued = False
         session.shutdown()
         session.deleteLater()
         self._set_busy(False)
         self._sync_queue_controls()
-        self._set_status(f"连接失败：{message}", True)
+        self._set_status(
+            f"观战失败：{message}"
+            if failed_spectate
+            else f"连接失败：{message}",
+            True,
+        )
 
     def _sync_queue_controls(self) -> None:
         queued = self._queued and self._session is not None
@@ -876,6 +911,7 @@ class OnlinePanel(InkBackdrop):
         self._session = None
         self._lobby_session = None
         self._queued = False
+        self._pending_action = ""
         if session is not None:
             session.shutdown()
             session.deleteLater()

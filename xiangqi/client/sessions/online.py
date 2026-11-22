@@ -36,6 +36,7 @@ from xiangqi.shared.protocol import (
     CLIENT_MOVE_INTENT,
     CLIENT_REMATCH,
     CLIENT_RESIGN,
+    CLIENT_SPECTATE,
     CLIENT_UNDO_REQUEST,
     CLIENT_UNDO_RESPONSE,
     SERVER_AUTH_OK,
@@ -49,6 +50,7 @@ from xiangqi.shared.protocol import (
     SERVER_MOVE_REJECTED,
     SERVER_QUEUE_STATUS,
     SERVER_REMATCH_REQUESTED,
+    SERVER_SPECTATE_ENDED,
     SERVER_UNDO_REQUESTED,
     SERVER_UNDO_RESULT,
     deserialize_board,
@@ -74,6 +76,7 @@ ACTION_CREATE = "create"
 ACTION_JOIN = "join"
 ACTION_QUEUE = "queue"
 ACTION_LOBBY = "lobby"
+ACTION_SPECTATE = "spectate"
 
 STATUS_CONNECTING = "connecting"
 STATUS_QUEUED = "queued"
@@ -101,6 +104,7 @@ class OnlineGameSession(GameSession):
     chat_received = Signal(object)  # ChatMessage
     chat_failed = Signal(str)  # 发言被拒/发送失败的中文提示
     direct_message = Signal(object)  # DirectMessage
+    spectate_ended = Signal(str)  # 观战结束原因
 
     def __init__(
         self,
@@ -109,6 +113,8 @@ class OnlineGameSession(GameSession):
         action: str,
         room_code: Optional[str] = None,
         parent: Optional[QObject] = None,
+        *,
+        target_name: Optional[str] = None,
     ) -> None:
         super().__init__(parent)
         if action not in (
@@ -116,6 +122,7 @@ class OnlineGameSession(GameSession):
             ACTION_JOIN,
             ACTION_QUEUE,
             ACTION_LOBBY,
+            ACTION_SPECTATE,
         ):
             raise ValueError(f"未知联机动作：{action}")
         self._transport = transport
@@ -126,6 +133,8 @@ class OnlineGameSession(GameSession):
         self._authed = False
         self._action = action
         self._join_code = (room_code or "").strip().upper()
+        self._target_name = (target_name or "").strip()
+        self._spectating = action == ACTION_SPECTATE
 
         self._view = BoardView.empty()
         self._status = STATUS_CONNECTING
@@ -193,6 +202,12 @@ class OnlineGameSession(GameSession):
                 CLIENT_JOIN_QUEUE,
                 request_id="queue",
             )
+        elif self._action == ACTION_SPECTATE:
+            self._send(
+                CLIENT_SPECTATE,
+                {"nickname": self._target_name},
+                request_id="spectate",
+            )
         else:
             self._send(
                 CLIENT_JOIN_ROOM,
@@ -257,6 +272,16 @@ class OnlineGameSession(GameSession):
     @property
     def action(self) -> str:
         return self._action
+
+    @property
+    def spectating(self) -> bool:
+        """当前会话是否是观战会话（只读）。"""
+        return self._spectating
+
+    @property
+    def target_name(self) -> str:
+        """观战目标好友的昵称。"""
+        return self._target_name
 
     @property
     def room_code(self) -> str:
@@ -330,6 +355,7 @@ class OnlineGameSession(GameSession):
             self._ready
             and self._connected
             and self._status == STATUS_PLAYING
+            and self._your_side is not None
             and self._view.move_count > 0
             and not self._awaiting_move
             and not self._awaiting_undo
@@ -345,6 +371,7 @@ class OnlineGameSession(GameSession):
             and not self._shutdown
             and not self._paused
             and self._authed
+            and self._your_side is not None
             and self._status in (STATUS_PLAYING, STATUS_FINISHED)
         )
 
@@ -420,12 +447,20 @@ class OnlineGameSession(GameSession):
         return True
 
     def request_resign(self) -> bool:
-        if self._status != STATUS_PLAYING or not self._connected:
+        if (
+            self._status != STATUS_PLAYING
+            or not self._connected
+            or self._your_side is None
+        ):
             return False
         return self._send(CLIENT_RESIGN)
 
     def request_restart(self) -> bool:
-        if self._status != STATUS_FINISHED or not self._connected:
+        if (
+            self._status != STATUS_FINISHED
+            or not self._connected
+            or self._your_side is None
+        ):
             return False
         return self._send(CLIENT_REMATCH)
 
@@ -634,6 +669,10 @@ class OnlineGameSession(GameSession):
             self._handle_chat(payload)
         elif message_type == SERVER_DIRECT_MESSAGE:
             self._handle_direct_message(payload)
+        elif message_type == SERVER_SPECTATE_ENDED:
+            self.spectate_ended.emit(
+                str(payload.get("reason", "观战已结束"))
+            )
         elif message_type == SERVER_ERROR:
             reason = str(payload.get("message", "联机错误"))
             chat_request = _request_id
@@ -680,6 +719,7 @@ class OnlineGameSession(GameSession):
                 if your_raw in (Side.RED.value, Side.BLACK.value)
                 else None
             )
+            spectating = bool(payload.get("spectator", False))
             winner_raw = payload.get("winner")
             winner = (
                 Side(winner_raw)
@@ -761,6 +801,9 @@ class OnlineGameSession(GameSession):
         )
         self._status = status
         self._your_side = your_side
+        self._spectating = (
+            self._action == ACTION_SPECTATE or spectating
+        )
         self._players = players
         self._ranked = ranked
         self._ratings = ratings
@@ -834,6 +877,7 @@ __all__ = [
     "ACTION_JOIN",
     "ACTION_QUEUE",
     "ACTION_LOBBY",
+    "ACTION_SPECTATE",
     "STATUS_CONNECTING",
     "STATUS_QUEUED",
     "STATUS_WAITING",

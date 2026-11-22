@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from server.app.main import create_app
+from server.app.ws.rooms import Connection, Room, RoomManager
 from xiangqi.shared.chat import (
     CHAT_BURST,
     CHAT_KIND_TEXT,
@@ -26,6 +27,7 @@ from xiangqi.shared.protocol import (
     CLIENT_MOVE_INTENT,
     CLIENT_REMATCH,
     CLIENT_RESIGN,
+    CLIENT_SPECTATE,
     CLIENT_UNDO_REQUEST,
     CLIENT_UNDO_RESPONSE,
     SERVER_AUTH_OK,
@@ -38,6 +40,7 @@ from xiangqi.shared.protocol import (
     SERVER_MOVE_REJECTED,
     SERVER_QUEUE_STATUS,
     SERVER_REMATCH_REQUESTED,
+    SERVER_SPECTATE_ENDED,
     SERVER_UNDO_REQUESTED,
     SERVER_UNDO_RESULT,
     make_message,
@@ -660,6 +663,85 @@ class OnlineServerTests(unittest.TestCase):
         )
         self.assertEqual(forbidden.status_code, 403)
 
+    def test_spectate_friend_game_is_read_only(self) -> None:
+        (
+            host,
+            guest,
+            _,
+            _,
+            code,
+            host_info,
+            _guest_info,
+        ) = self._open_pair()
+        spectator, spectator_info = self._socket("观战者")
+        host_headers = {
+            "Authorization": f"Bearer {host_info['token']}"
+        }
+        spectator_headers = {
+            "Authorization": f"Bearer {spectator_info['token']}"
+        }
+        requested = self.client.post(
+            "/api/v1/profile/friends",
+            json={"nickname": "红方棋友"},
+            headers=spectator_headers,
+        )
+        self.assertEqual(requested.status_code, 200, requested.text)
+        accepted = self.client.post(
+            "/api/v1/profile/friends/accept",
+            json={"nickname": "观战者"},
+            headers=host_headers,
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+
+        friends = self.client.get(
+            "/api/v1/profile/friends", headers=spectator_headers
+        ).json()["friends"]
+        row = {
+            item["nickname"]: item for item in friends
+        }["红方棋友"]
+        self.assertTrue(row["online"])
+        self.assertTrue(row["in_game"])
+        self.assertEqual(row["game_status"], "playing")
+        self.assertTrue(code)
+
+        spectator.send_json(
+            make_message(
+                CLIENT_SPECTATE, {"nickname": "红方棋友"}
+            )
+        )
+        state = receive_state(spectator)
+        self.assertTrue(state["spectator"])
+        self.assertIsNone(state["your_side"])
+        self.assertEqual(state["status"], "playing")
+        self.assertEqual(
+            state["players"]["red"]["name"], "红方棋友"
+        )
+        self.assertEqual(state["move_count"], 0)
+
+        send_move(host, 6, 0, 5, 0)
+        receive_state(host)
+        receive_state(guest)
+        spectator_state = receive_state(spectator)
+        self.assertEqual(spectator_state["move_count"], 1)
+        self.assertEqual(
+            spectator_state["side_to_move"], "black"
+        )
+
+        send_move(spectator, 3, 0, 4, 0)
+        rejected = receive(spectator)
+        self.assertEqual(rejected["type"], SERVER_MOVE_REJECTED)
+        self.assertIn("轮到你", rejected["payload"]["reason"])
+
+        stranger, _stranger_info = self._socket("陌生观战者")
+        stranger.send_json(
+            make_message(
+                CLIENT_SPECTATE, {"nickname": "红方棋友"}
+            )
+        )
+        error = receive(stranger)
+        self.assertEqual(error["type"], SERVER_ERROR)
+        self.assertIn("好友", error["payload"]["message"])
+
     # ------------------------------------------------------------------
     # 排位匹配
     # ------------------------------------------------------------------
@@ -1012,6 +1094,42 @@ class OnlineServerTests(unittest.TestCase):
             headers=first_headers,
         )
         self.assertEqual(self_request.status_code, 400)
+
+
+class SpectatorEndTests(unittest.IsolatedAsyncioTestCase):
+    """房间关闭时结束观战的通知与状态清理。"""
+
+    async def test_end_spectators_notifies_and_clears(self) -> None:
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.sent: list[dict] = []
+
+            async def send_json(self, message: dict) -> None:
+                self.sent.append(message)
+
+        manager = RoomManager(None)  # type: ignore[arg-type]
+        room = Room(code="ABCD")
+        websocket = FakeWebSocket()
+        conn = Connection(
+            websocket=websocket,  # type: ignore[arg-type]
+            user_id=3,
+            name="观战者",
+            room_code="ABCD",
+            spectating=True,
+        )
+        room.spectators[3] = conn
+
+        await manager._end_spectators(room, "对局已结束")
+
+        self.assertEqual(room.spectators, {})
+        self.assertFalse(conn.spectating)
+        self.assertIsNone(conn.room_code)
+        self.assertEqual(len(websocket.sent), 1)
+        message = websocket.sent[0]
+        self.assertEqual(message["type"], SERVER_SPECTATE_ENDED)
+        self.assertEqual(
+            message["payload"]["reason"], "对局已结束"
+        )
 
 
 if __name__ == "__main__":

@@ -350,6 +350,7 @@ class MainWindow(QMainWindow):
             )
             session.chat_received.connect(self._on_chat_received)
             session.chat_failed.connect(self._on_chat_failed)
+            session.spectate_ended.connect(self._on_spectate_ended)
 
     def _replace_session(self) -> None:
         """关闭旧会话、创建新会话并刷新界面。"""
@@ -925,7 +926,10 @@ class MainWindow(QMainWindow):
         session = self._session
         if not isinstance(session, OnlineGameSession):
             return
-        if session.status in (ONLINE_PLAYING, ONLINE_FINISHED):
+        if (
+            not session.spectating
+            and session.status in (ONLINE_PLAYING, ONLINE_FINISHED)
+        ):
             session.pause()
             if not self._confirm_discard_game(
                 "离开房间",
@@ -1070,6 +1074,9 @@ class MainWindow(QMainWindow):
             overlay.chat_requested.connect(
                 self._on_friend_chat_requested
             )
+            overlay.spectate_requested.connect(
+                self._on_friend_spectate_requested
+            )
             self._friends_overlay = overlay
             self._active_modal = overlay
             overlay.exec()
@@ -1112,6 +1119,37 @@ class MainWindow(QMainWindow):
     def _on_social_profile_requested(self, nickname: str) -> None:
         """排行榜/好友窗口中点击头像：在模态层上方再打开资料窗口。"""
         self._show_profile_overlay(nickname, nested=True)
+
+    def _on_friend_spectate_requested(self, nickname: str) -> None:
+        """好友窗口中点击「观战」：关闭好友窗并进入观战。"""
+        if not nickname:
+            return
+        started = self.online_page.start_spectate(nickname)
+        if started:
+            if self._friends_overlay is not None:
+                self._friends_overlay.accept()
+        elif self._friends_overlay is not None:
+            self._friends_overlay.set_status(
+                "当前无法开始观战，请稍后再试", True
+            )
+
+    def _on_spectate_ended(self, reason: str) -> None:
+        """服务端通知观战结束：提示后回到联机大厅。"""
+        session = self._session
+        if (
+            not isinstance(session, OnlineGameSession)
+            or not session.spectating
+            or self._closing
+            or not self._is_game_page_active()
+        ):
+            return
+        if self._modal_dialog_open or self._result_dialog_open:
+            QTimer.singleShot(
+                100, lambda: self._on_spectate_ended(reason)
+            )
+            return
+        self._show_notice("观战结束", reason or "对局已结束")
+        self._leave_online_to_lobby()
 
     def _on_friend_chat_requested(
         self,
@@ -1395,18 +1433,18 @@ class MainWindow(QMainWindow):
         self.first_group.setVisible(ai_mode)
         if online_mode:
             session = self._session
-            code = (
-                session.room_code
-                if isinstance(session, OnlineGameSession)
-                else ""
-            )
-            prefix = (
-                "排位赛"
-                if isinstance(session, OnlineGameSession)
+            if (
+                isinstance(session, OnlineGameSession)
+                and session.spectating
+            ):
+                prefix = "观战"
+            elif (
+                isinstance(session, OnlineGameSession)
                 and session.ranked
-                else "自建房"
-            )
-            del code
+            ):
+                prefix = "排位赛"
+            else:
+                prefix = "自建房"
             self.local_mode_label.setText(prefix)
             self.move_hint_label.setVisible(False)
         elif ai_mode:
@@ -1539,6 +1577,8 @@ class MainWindow(QMainWindow):
 
         if isinstance(self._session, OnlineGameSession):
             session = self._session
+            if session.spectating:
+                return
             if session.status == ONLINE_PLAYING:
                 if not self._confirm_discard_game(
                     "认输",
@@ -1803,6 +1843,11 @@ class MainWindow(QMainWindow):
         view = session.view
         if not view.is_game_over:
             return
+        if (
+            isinstance(session, OnlineGameSession)
+            and session.spectating
+        ):
+            return
 
         moves = tuple(session.move_history)
         metadata: dict[str, object] = {}
@@ -1976,6 +2021,11 @@ class MainWindow(QMainWindow):
             if session.view.end_reason is EndReason.CHECKMATE:
                 return
             manager = get_audio_manager()
+            if (
+                isinstance(session, OnlineGameSession)
+                and session.spectating
+            ):
+                return
             if isinstance(session, OnlineGameSession):
                 human_side = session.human_side
                 if (
@@ -2052,6 +2102,10 @@ class MainWindow(QMainWindow):
         view: BoardView,
     ) -> ResultPresentation:
         """根据胜者与结束原因生成古风终局文案。"""
+        spectating = bool(
+            isinstance(self._session, OnlineGameSession)
+            and self._session.spectating
+        )
         if view.winner is None:
             return ResultPresentation(
                 kind="draw",
@@ -2059,10 +2113,24 @@ class MainWindow(QMainWindow):
                 subtitle="胜负未分",
                 detail=f"本局共 {view.move_count} 手",
                 seal_text="和",
+                primary_text=(
+                    "继续观战" if spectating else "再来一局"
+                ),
             )
 
         reason = view.end_reason
         subtitle = reason.label if isinstance(reason, EndReason) else "胜负已分"
+
+        if spectating:
+            return ResultPresentation(
+                kind="win",
+                title=f"{view.winner.label}胜",
+                subtitle=f"{subtitle} · 观战",
+                detail=f"本局共 {view.move_count} 手",
+                seal_text="胜",
+                primary_text="继续观战",
+                secondary_text="查看棋盘",
+            )
 
         if isinstance(self._session, OnlineGameSession):
             human_side = self._session.human_side
@@ -2205,15 +2273,24 @@ class MainWindow(QMainWindow):
             if (ai_mode or online_mode)
             else None
         )
+        spectating = bool(
+            online_mode
+            and online_session is not None
+            and online_session.spectating
+        )
         # 联机执黑时棋盘整体颠倒，让自己的棋子在下方。
         self.board_widget.set_flipped(
             online_mode and human_side is Side.BLACK
         )
-        self.chat_bar.setVisible(online_mode)
+        self.chat_bar.setVisible(online_mode and not spectating)
         self.chat_log.setVisible(
-            online_mode and self._chat_log_expanded
+            online_mode
+            and not spectating
+            and self._chat_log_expanded
         )
-        self._refresh_chat_controls(online_mode)
+        self._refresh_chat_controls(
+            online_mode and not spectating
+        )
         difficulty_label = (
             self._session.difficulty.label if ai_mode else ""
         )
@@ -2304,15 +2381,29 @@ class MainWindow(QMainWindow):
         )
         if winner is not None:
             if online_mode:
-                who = "你" if winner is human_side else "对手"
-                pill_text = f"{who}获胜 · {reason_label}"
+                if spectating:
+                    pill_text = f"{winner.label}胜 · {reason_label}"
+                else:
+                    who = "你" if winner is human_side else "对手"
+                    pill_text = f"{who}获胜 · {reason_label}"
             elif ai_mode:
                 who = "你" if winner is human_side else "AI"
                 pill_text = f"{who}获胜 · {reason_label}"
             else:
                 pill_text = f"{winner.label}胜 · {reason_label}"
         elif online_mode:
-            if online_status == ONLINE_WAITING:
+            if spectating:
+                if online_status == ONLINE_DISCONNECTED:
+                    pill_text = "观战连接已断开"
+                elif view.is_check:
+                    pill_text = (
+                        f"{view.side_to_move.label}被将军"
+                    )
+                else:
+                    pill_text = (
+                        f"观战 · {view.side_to_move.label}行棋"
+                    )
+            elif online_status == ONLINE_WAITING:
                 pill_text = "等待好友接受挑战…"
             elif online_status == ONLINE_DISCONNECTED:
                 pill_text = "连接已断开"
@@ -2357,7 +2448,15 @@ class MainWindow(QMainWindow):
                 f"第 {view.move_count} 手 · 对局结束"
             )
         elif online_mode:
-            if online_status == ONLINE_WAITING:
+            if spectating:
+                if online_status == ONLINE_DISCONNECTED:
+                    self.move_label.setText("观战 · 连接已断开")
+                else:
+                    self.move_label.setText(
+                        f"观战 · 第 {view.move_count} 手 · "
+                        f"{view.side_to_move.label}行棋"
+                    )
+            elif online_status == ONLINE_WAITING:
                 self.move_label.setText("自建房 · 等待好友接受挑战")
             elif online_status == ONLINE_DISCONNECTED:
                 self.move_label.setText("第 0 手 · 连接已断开")
@@ -2396,27 +2495,43 @@ class MainWindow(QMainWindow):
             waiting_host = (
                 online_status == ONLINE_WAITING
                 and human_side is Side.RED
+                and not spectating
             )
             self.invite_button.setVisible(waiting_host)
             self.invite_button.setEnabled(waiting_host)
-            self.undo_button.setToolTip("请求悔棋（需对手同意）")
-            if online_status == ONLINE_PLAYING:
-                self.restart_button.setText("认输")
-                self.restart_button.setEnabled(True)
-            elif online_status == ONLINE_FINISHED:
-                self.restart_button.setText("请求再战")
-                self.restart_button.setEnabled(opponent_connected)
-            else:
-                self.restart_button.setText("认输")
+            if spectating:
+                self.undo_button.setVisible(False)
+                self.restart_button.setVisible(False)
                 self.restart_button.setEnabled(False)
-            self.menu_back_button.setText("离开房间")
-            self.hint_label.setText(
-                "点击「邀请好友」让好友接受挑战后开局"
-                if waiting_host
-                else "Ctrl+Z 请求悔棋"
-            )
+                self.menu_back_button.setText("离开观战")
+                self.hint_label.setText("观战模式 · 棋盘只读")
+            else:
+                self.undo_button.setVisible(True)
+                self.restart_button.setVisible(True)
+                self.undo_button.setToolTip(
+                    "请求悔棋（需对手同意）"
+                )
+                if online_status == ONLINE_PLAYING:
+                    self.restart_button.setText("认输")
+                    self.restart_button.setEnabled(True)
+                elif online_status == ONLINE_FINISHED:
+                    self.restart_button.setText("请求再战")
+                    self.restart_button.setEnabled(
+                        opponent_connected
+                    )
+                else:
+                    self.restart_button.setText("认输")
+                    self.restart_button.setEnabled(False)
+                self.menu_back_button.setText("离开房间")
+                self.hint_label.setText(
+                    "点击「邀请好友」让好友接受挑战后开局"
+                    if waiting_host
+                    else "Ctrl+Z 请求悔棋"
+                )
         else:
             self.invite_button.setVisible(False)
+            self.undo_button.setVisible(True)
+            self.restart_button.setVisible(True)
             self.undo_button.setToolTip(
                 "撤销你与 AI 的上一回合（Ctrl+Z）"
                 if ai_mode
