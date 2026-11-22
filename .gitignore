@@ -1,0 +1,33 @@
+# 虚拟环境
+.venv/
+server/.venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 构建产物
+build/
+dist/
+*.exe
+*.spec.bak
+.upx/
+
+# 运行期数据与日志
+*.log
+*.db
+server/data/
+runtime.json
+
+# 本地配置与密钥
+.env
+.env.*
+jwt_secret.txt
+
+# 编辑器/系统
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db

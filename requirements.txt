@@ -1,0 +1,4 @@
+# 运行期依赖：PySide6 核心包 + Addons（QtMultimedia 音效）。
+# 不安装完整 PySide6 元包中的 WebEngine/PDF 等大型模块。
+PySide6-Essentials>=6.6,<7.0
+PySide6-Addons>=6.6,<7.0
