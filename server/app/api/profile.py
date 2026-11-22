@@ -52,6 +52,19 @@ def friend_payload(user: User) -> dict[str, object]:
     }
 
 
+def friend_entry(
+    friend: User,
+    *,
+    online: bool = False,
+    unread: int = 0,
+) -> dict[str, object]:
+    """好友列表条目：附带在线状态与未读私聊数。"""
+    payload = friend_payload(friend)
+    payload["online"] = bool(online)
+    payload["unread"] = int(unread)
+    return payload
+
+
 def profile_payload(
     user: User,
     *,
@@ -181,12 +194,25 @@ def create_router(
 
     @router.get("/friends")
     def list_friends(
+        request: Request,
         user: User = Depends(current_user),
     ) -> dict[str, object]:
         incoming, outgoing = users.list_friend_requests(user.id)
+        unread = users.unread_counts(user.id)
+        manager = getattr(
+            request.app.state, "room_manager", None
+        )
         return {
             "friends": [
-                friend_payload(friend)
+                friend_entry(
+                    friend,
+                    online=(
+                        manager.is_online(friend.id)
+                        if manager is not None
+                        else False
+                    ),
+                    unread=unread.get(friend.id, 0),
+                )
                 for friend in users.list_friends(user.id)
             ],
             "incoming": [friend_payload(item) for item in incoming],

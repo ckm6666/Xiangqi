@@ -35,6 +35,8 @@ class FriendsOverlay(ModalOverlay):
     """好友与好友申请管理窗口。"""
 
     profile_requested = Signal(str)
+    #: 好友昵称、头像标识、是否在线
+    chat_requested = Signal(str, str, bool)
 
     def __init__(
         self,
@@ -258,7 +260,6 @@ class FriendsOverlay(ModalOverlay):
         for player in self._search_results:
             relationship = str(player.get("relationship", "none"))
             status = {
-                "friend": "已是好友",
                 "pending_out": "已发送申请",
                 "pending_in": "待你同意",
             }.get(relationship, "点击头像查看资料")
@@ -267,7 +268,8 @@ class FriendsOverlay(ModalOverlay):
                 incoming=False,
                 outgoing=False,
                 friends=False,
-                status_text=status,
+                status_text=None if relationship == "friend" else status,
+                search=True,
             )
 
     def _clear_body(self) -> None:
@@ -287,7 +289,6 @@ class FriendsOverlay(ModalOverlay):
         incoming: bool = False,
         outgoing: bool = False,
         friends: bool = False,
-        status_text: Optional[str] = None,
     ) -> None:
         section = QLabel(title, self)
         section.setObjectName("sectionTitle")
@@ -309,7 +310,6 @@ class FriendsOverlay(ModalOverlay):
                 incoming=incoming,
                 outgoing=outgoing,
                 friends=friends,
-                status_text=status_text,
             )
 
     def _add_row(
@@ -320,6 +320,7 @@ class FriendsOverlay(ModalOverlay):
         outgoing: bool,
         friends: bool,
         status_text: Optional[str] = None,
+        search: bool = False,
     ) -> None:
         row = QFrame(self)
         row.setObjectName("friendsRow")
@@ -330,6 +331,12 @@ class FriendsOverlay(ModalOverlay):
 
         nickname = str(player.get("nickname", "棋友"))
         avatar_id = str(player.get("avatar", "default:1"))
+        online = bool(player.get("online"))
+        try:
+            unread = int(player.get("unread", 0) or 0)
+        except (TypeError, ValueError):
+            unread = 0
+        relationship = str(player.get("relationship", "none"))
         avatar_button = QPushButton(row)
         avatar_button.setObjectName("leaderboardAvatar")
         avatar_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -373,9 +380,22 @@ class FriendsOverlay(ModalOverlay):
         info_label.setObjectName("leaderboardTitleText")
         text_col.addWidget(name_label)
         text_col.addWidget(info_label)
+        if friends or search:
+            presence = QLabel(
+                "● 在线" if online else "○ 离线", row
+            )
+            presence.setObjectName("friendPresence")
+            presence.setProperty(
+                "online", "true" if online else "false"
+            )
+            text_col.addWidget(presence)
 
         layout.addWidget(avatar_button)
         layout.addLayout(text_col, 1)
+        if friends and unread > 0:
+            badge = QLabel(f"{unread} 条未读", row)
+            badge.setObjectName("friendUnread")
+            layout.addWidget(badge)
         if incoming:
             accept = QPushButton("同意", row)
             accept.setObjectName("friendAcceptButton")
@@ -397,10 +417,20 @@ class FriendsOverlay(ModalOverlay):
             waiting = QLabel("等待对方同意", row)
             waiting.setObjectName("friendsEmpty")
             layout.addWidget(waiting)
-        elif friends:
-            kind = QLabel("已是好友", row)
-            kind.setObjectName("friendsEmpty")
-            layout.addWidget(kind)
+        elif friends or (
+            search and relationship == "friend"
+        ):
+            chat = QPushButton("聊天", row)
+            chat.setObjectName("socialSecondaryButton")
+            chat.setCursor(Qt.CursorShape.PointingHandCursor)
+            chat.setMinimumHeight(30)
+            chat.clicked.connect(
+                lambda _checked=False, name=nickname, avatar=avatar_id,
+                is_online=online: self.chat_requested.emit(
+                    name, avatar, is_online
+                )
+            )
+            layout.addWidget(chat)
         elif status_text:
             status = QLabel(status_text, row)
             status.setObjectName("friendsEmpty")

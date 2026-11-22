@@ -13,6 +13,9 @@
 - 个人资料接口：称号、战绩、胜率、成就、6 个内置头像/自定义上传；
 - 好友系统：好友申请、同意/拒绝、好友列表；排行榜按积分降序返回
   所有已登录账号的名次、称号、头像与战绩，并可查看任意玩家资料；
+- 好友私聊：消息持久化在 SQLite，支持历史、未读/已读和 WebSocket
+  实时推送；好友列表返回在线状态与未读数；
+- 对局聊天：表情/快捷评论/文本由服务端校验、限流后广播给对局双方；
 - 服务器权威走子：客户端只发送 `move_intent`，由服务端复用
   `xiangqi.shared.game_model.GameModel` 校验并广播完整 `game_state`；
   `game_state.moves` 携带完整着法历史供客户端棋谱复盘；
@@ -77,11 +80,24 @@ python run_server.py --stop        # 或双击 stop_server.vbs
   `GET /api/v1/profile/avatar/{昵称}`）：公开读取自定义头像 PNG；
   内置头像返回 404，由客户端本地绘制。
 - `GET /api/v1/profile/friends`：返回 `friends`（好友）、`incoming`
-  （收到的申请）、`outgoing`（我发出的申请）。
+  （收到的申请）、`outgoing`（我发出的申请）；好友项附带 `online`
+  与未读私聊数 `unread`。
 - `POST /api/v1/profile/friends`：`{"nickname": "棋友"}` 发送好友申请；
   若对方已先申请则直接成为好友。
 - `POST /api/v1/profile/friends/accept` / `decline`：
   `{"nickname": "申请人"}` 同意或拒绝收到的申请。
+
+## 好友私聊接口
+
+私聊只允许已接受的好友之间进行；正文最多 200 字，服务端会净化控制/
+格式字符并做 10 秒 10 条的限流。
+
+- `GET /api/v1/messages?nickname=好友&limit=50`：读取最近私聊（时间正序），
+  本次返回的来信会被标记为已读。
+- `POST /api/v1/messages?nickname=好友`：`{"content": "你好"}` 发送私聊；
+  对方在线时通过 WebSocket `direct_message` 实时推送，离线时存入 SQLite。
+- `POST /api/v1/messages/read?nickname=好友`：
+  `{"message_ids": ["12", "13"]}` 把聊天窗已显示的来信标记为已读。
 
 ## 玩家与排行榜接口
 
@@ -118,9 +134,10 @@ python run_server.py --stop        # 或双击 stop_server.vbs
 server/
 ├── app/
 │   ├── main.py          # create_app()、/api/v1/health、路由装配
-│   ├── users.py         # SQLite 账号/积分/战绩/头像/好友、PBKDF2、令牌
+│   ├── users.py         # SQLite 账号/积分/战绩/头像/好友/私聊、PBKDF2、令牌
 │   ├── api/auth.py      # REST 注册/登录
 │   ├── api/profile.py   # 个人资料/头像/好友申请
+│   ├── api/messages.py  # 好友私聊历史/发送/已读
 │   ├── api/players.py   # 排行榜与公开玩家资料
 │   ├── api/deps.py      # Bearer 令牌依赖
 │   └── ws/
@@ -162,6 +179,7 @@ server/
 | C→S | `undo_request` | 空 |
 | C→S | `undo_response` | `{"accept": true}` |
 | C→S | `resign` / `rematch` / `leave` | 空；排队中发送 `leave` 即取消匹配 |
+| C→S | `chat` | `{"kind": "emoji"\|"text", "content": "..."}`（对局内） |
 | S→C | `auth_ok` | `{"user_id", "nickname", "rating"}` |
 | S→C | `game_state` | 房间、双方、棋盘、行棋方、终局、悔棋/再战、排位信息 |
 | S→C | `queue_status` | `{"message", "position", "queued", "rating"}` |
@@ -172,7 +190,9 @@ server/
 | S→C | `invite_result` | `{"status", "accepted", "name", "reason"}` |
 | S→C | `challenge` | `{"challenge_id", "name"}`（好友收到挑战） |
 | S→C | `challenge_cancelled` | `{"challenge_id", "reason"}` |
-| S→C | `error` | `{"message"}` |
+| S→C | `chat_message` | `{"kind", "content", "sender_id", "sender_name", "sent_at_ms"}` |
+| S→C | `direct_message` | `{"id", "sender_id", "sender_name", "recipient_id", "content", "sent_at_ms"}` |
+| S→C | `error` | `{"message"}`（发言被拒时带 `request_id`） |
 
 `game_state` 关键字段：
 
@@ -217,7 +237,7 @@ server/
 - 仅排位匹配产生的房间（`ranked: true`）计分；
 - 终局快照的 `players.*.rating_delta` 为本局加减分，再来一局后清空；
 - 所有联机终局都会给双方累计胜/负与当前/最高连胜，且只记录一次；
-- 积分与战绩写入 SQLite 账号表，重新登录即可看到；无排行榜。
+- 积分与战绩写入 SQLite 账号表，排行榜、个人资料与好友列表直接读取。
 
 ## 测试
 
@@ -230,12 +250,13 @@ server\.venv\Scripts\python.exe -m unittest server.tests.test_online -v
 非法着法、悔棋同意/拒绝、认输、再战、断线、同账号重连、满房拒绝，
 排位队列配对/取消/出队、Elo 加减分与持久化、再战清除加减分，以及
 个人资料、战绩、成就、默认/自定义头像、好友申请/同意/拒绝、昵称搜索、
-排行榜（包含尚无对局的新账号）、玩家资料、自建房邀请与挑战接受/拒绝。
+排行榜（包含尚无对局的新账号）、玩家资料、自建房邀请与挑战接受/拒绝、
+对局表情/评论广播与限流、好友私聊持久化/未读/已读/实时推送。
 
 ## 已知限制
 
-- 房间在进程内存中；账号、积分、战绩、头像与好友持久化在
-  `server/data/xiangqi.db`；
+- 房间在进程内存中；账号、积分、战绩、头像、好友与私聊消息持久化在
+  `server/data/xiangqi.db`；对局聊天不落库；
 - 登录令牌保存在进程内存，24 小时有效，服务端重启后需重新登录；
 - 断线后房间保留以便同账号重连，但双方都断开后房间删除；
 - 无每步时钟、超时判负与观战；

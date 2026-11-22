@@ -4,8 +4,9 @@
 
     server\\.venv\\Scripts\\python.exe -m uvicorn server.app.main:app --port 8765
 
-0.7.0 提供 SQLite 账号、排位、战绩、头像、好友、REST 登录注册与资料接口。
-账号与排位分持久化在 server/data/xiangqi.db；登录令牌保存在内存中。
+0.7.0 提供 SQLite 账号、排位、战绩、头像、好友、私聊与对局聊天，以及
+REST 登录注册、资料与私聊接口。账号、排位分与私聊持久化在
+server/data/xiangqi.db；登录令牌保存在内存中。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Optional
 from fastapi import FastAPI
 
 from server.app.api.auth import create_router as create_auth_router
+from server.app.api.messages import create_router as create_messages_router
 from server.app.api.players import create_router as create_players_router
 from server.app.api.profile import create_router as create_profile_router
 from server.app.users import AuthManager, UserStore
@@ -51,6 +53,7 @@ def create_app(db_path: Optional[Path] = None) -> FastAPI:
 
     app.include_router(create_auth_router(users, auth_manager))
     app.include_router(create_profile_router(users, auth_manager))
+    app.include_router(create_messages_router(users, auth_manager))
     app.include_router(create_players_router(users, auth_manager))
     app.include_router(create_router(manager, auth_manager))
 

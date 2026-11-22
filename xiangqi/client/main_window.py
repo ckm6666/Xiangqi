@@ -15,7 +15,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Callable, Optional
 
-from PySide6.QtCore import QPointF, QTimer, Qt
+from PySide6.QtCore import QEvent, QPointF, QSettings, QTimer, Qt
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QSizePolicy,
@@ -43,8 +44,14 @@ from xiangqi.client.ai_engine import AIDifficulty
 from xiangqi.client.audio import get_audio_manager
 from xiangqi.client.board_view import BoardView
 from xiangqi.client.board_widget import BoardWidget
+from xiangqi.client.chat_widgets import (
+    ChatLogPanel,
+    EmojiPickerButton,
+    PresetCommentButton,
+)
 from xiangqi.client.config import AppConfig
 from xiangqi.client.confirm_dialog import ConfirmDialog
+from xiangqi.client.danmaku import DanmakuOverlay
 from xiangqi.client.constants import (
     AI_START_DELAY_MS,
     APP_NAME,
@@ -62,6 +69,7 @@ from xiangqi.client.invite_overlay import InviteFriendOverlay
 from xiangqi.client.leaderboard_overlay import LeaderboardOverlay
 from xiangqi.client.modal_overlay import ModalOverlay, NoticeOverlay
 from xiangqi.client.online_panel import OnlinePanel
+from xiangqi.client.private_chat_overlay import PrivateChatOverlay
 from xiangqi.client.profile_overlay import ProfileOverlay
 from xiangqi.client.records import LocalRecordStore
 from xiangqi.client.replay_panel import ReplayPanel
@@ -87,8 +95,13 @@ from xiangqi.client.ui_theme import (
     RicePaperCard,
 )
 from xiangqi.client.voice import get_voice_announcer
+from xiangqi.shared.chat import (
+    CHAT_KIND_EMOJI,
+    MAX_COMMENT_LENGTH,
+)
 from xiangqi.shared.profile import title_for_rating
 from xiangqi.shared.record import GameRecord
+from xiangqi.shared.social import DirectMessage
 from xiangqi.shared.rules import (
     BOARD_COLS,
     BOARD_ROWS,
@@ -100,6 +113,11 @@ from xiangqi.shared.rules import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: 对局聊天输入框的常规占位提示。
+CHAT_INPUT_HINT = "说点什么…（回车发送）"
+#: 对话日志展开状态在 QSettings 里的键名。
+SETTINGS_CHAT_LOG_VISIBLE = "chat_log_visible"
 
 
 class GameMode(Enum):
@@ -239,9 +257,16 @@ class MainWindow(QMainWindow):
         self._modal_dialog_open = False
         self._closing = False
         self._invite_overlay: Optional[InviteFriendOverlay] = None
+        self._friends_overlay: Optional[FriendsOverlay] = None
+        self._private_chat_overlay: Optional[PrivateChatOverlay] = None
         self._challenge_dialog: Optional[ConfirmDialog] = None
         self._challenge_dialog_id = ""
         self._challenge_cancelled = False
+
+        # 对局聊天：对话日志默认收起，用户展开状态保存在 QSettings。
+        self._settings = QSettings()
+        self._chat_log_expanded = False
+        self._chat_unread = 0
 
         # 单次终局弹窗定时器：用于等待绝杀特效/语音结束后再弹窗。
         self._result_timer = QTimer(self)
@@ -323,6 +348,8 @@ class MainWindow(QMainWindow):
             session.rematch_requested.connect(
                 self._on_online_rematch_requested
             )
+            session.chat_received.connect(self._on_chat_received)
+            session.chat_failed.connect(self._on_chat_failed)
 
     def _replace_session(self) -> None:
         """关闭旧会话、创建新会话并刷新界面。"""
@@ -382,6 +409,9 @@ class MainWindow(QMainWindow):
         )
         self.online_page.challenge_cancelled.connect(
             self._on_challenge_cancelled
+        )
+        self.online_page.direct_message_received.connect(
+            self._on_direct_message_received
         )
         self.replay_page = ReplayPanel(self._record_store, self.stack)
         self.replay_page.back_requested.connect(
@@ -537,9 +567,81 @@ class MainWindow(QMainWindow):
 
         self.board_widget = BoardWidget(self._session.view, page)
         self.board_widget.cell_clicked.connect(self._on_cell_clicked)
-        root_layout.addWidget(self.board_widget, 1)
+        self.danmaku_overlay = DanmakuOverlay(self.board_widget)
+        self.danmaku_overlay.set_board_widget(self.board_widget)
+        self.danmaku_overlay.setGeometry(self.board_widget.rect())
+        self.danmaku_overlay.raise_()
+        self.board_widget.installEventFilter(self)
+
+        play_area = QHBoxLayout()
+        play_area.setContentsMargins(0, 0, 0, 0)
+        play_area.setSpacing(10)
+        play_area.addWidget(self.board_widget, 1)
+
+        self.chat_log = ChatLogPanel(page)
+        self.chat_log.setMinimumWidth(210)
+        self.chat_log.setMaximumWidth(300)
+        self.chat_log.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
+        )
+        play_area.addWidget(self.chat_log, 0)
+        root_layout.addLayout(play_area, 1)
+
+        self.chat_bar = QWidget(page)
+        chat_bar = QHBoxLayout(self.chat_bar)
+        chat_bar.setContentsMargins(0, 0, 0, 0)
+        chat_bar.setSpacing(8)
+        self.emoji_button = EmojiPickerButton(self.chat_bar)
+        self.preset_comment_button = PresetCommentButton(
+            self.chat_bar
+        )
+        self.chat_input = QLineEdit(self.chat_bar)
+        self.chat_input.setObjectName("chatInput")
+        self.chat_input.setMaxLength(MAX_COMMENT_LENGTH)
+        self.chat_input.setPlaceholderText(CHAT_INPUT_HINT)
+        self.chat_send_button = QPushButton("发送", self.chat_bar)
+        self.chat_send_button.setObjectName("chatSendButton")
+        self.chat_log_toggle_button = QPushButton(
+            "对话日志", self.chat_bar
+        )
+        self.chat_log_toggle_button.setObjectName(
+            "chatLogToggleButton"
+        )
+        self.chat_log_toggle_button.setCheckable(True)
+        for button in (
+            self.emoji_button,
+            self.preset_comment_button,
+            self.chat_send_button,
+            self.chat_log_toggle_button,
+        ):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setAutoDefault(False)
+        chat_bar.addWidget(self.emoji_button)
+        chat_bar.addWidget(self.preset_comment_button)
+        chat_bar.addWidget(self.chat_input, 1)
+        chat_bar.addWidget(self.chat_send_button)
+        chat_bar.addWidget(self.chat_log_toggle_button)
+        self.chat_bar.setVisible(False)
+        root_layout.addWidget(self.chat_bar)
 
         root_layout.addLayout(self._build_footer())
+
+        self.emoji_button.emoji_picked.connect(
+            self._on_emoji_picked
+        )
+        self.preset_comment_button.comment_picked.connect(
+            self._on_preset_comment_picked
+        )
+        self.chat_send_button.clicked.connect(self._on_send_comment)
+        self.chat_input.returnPressed.connect(self._on_send_comment)
+        self.chat_log_toggle_button.toggled.connect(
+            self._on_chat_log_toggled
+        )
+        self._apply_chat_log_visibility(
+            self._load_chat_log_visible()
+        )
+        self._refresh_chat_controls()
         return page
 
     def _build_header(self) -> QHBoxLayout:
@@ -965,9 +1067,14 @@ class MainWindow(QMainWindow):
             overlay.profile_requested.connect(
                 self._on_social_profile_requested
             )
+            overlay.chat_requested.connect(
+                self._on_friend_chat_requested
+            )
+            self._friends_overlay = overlay
             self._active_modal = overlay
             overlay.exec()
         finally:
+            self._friends_overlay = None
             self._active_modal = None
             self._modal_dialog_open = False
             if overlay is not None:
@@ -1005,6 +1112,88 @@ class MainWindow(QMainWindow):
     def _on_social_profile_requested(self, nickname: str) -> None:
         """排行榜/好友窗口中点击头像：在模态层上方再打开资料窗口。"""
         self._show_profile_overlay(nickname, nested=True)
+
+    def _on_friend_chat_requested(
+        self,
+        nickname: str,
+        avatar: str,
+        online: bool,
+    ) -> None:
+        """好友窗口中点击「聊天」：打开私聊浮层。"""
+        if not nickname:
+            return
+        self._show_private_chat_overlay(
+            nickname, avatar, online
+        )
+
+    def _show_private_chat_overlay(
+        self,
+        nickname: str,
+        avatar: str,
+        online: Optional[bool],
+    ) -> None:
+        """显示与某位好友的私聊窗口（可叠在好友窗口之上）。"""
+        if self._closing or self._result_dialog_open:
+            return
+        token = self.online_page.token
+        base_url = self.online_page.http_base_url
+        if not token or not base_url:
+            return
+
+        previous_modal = self._active_modal
+        was_modal_open = self._modal_dialog_open
+        self._modal_dialog_open = True
+        overlay: Optional[PrivateChatOverlay] = None
+        try:
+            overlay = PrivateChatOverlay(
+                None,
+                base_url,
+                token,
+                nickname,
+                self.online_page.nickname,
+                avatar=avatar,
+                online=online,
+                parent=self._overlay_host(),
+            )
+            self._private_chat_overlay = overlay
+            self._active_modal = overlay
+            overlay.exec()
+        finally:
+            self._private_chat_overlay = None
+            self._active_modal = previous_modal
+            self._modal_dialog_open = was_modal_open
+            if overlay is not None:
+                overlay.deleteLater()
+            if previous_modal is not None:
+                previous_modal.setFocus()
+                refresher = getattr(previous_modal, "refresh", None)
+                if callable(refresher):
+                    refresher()
+
+    def _on_direct_message_received(self, message: object) -> None:
+        """好友私聊实时推送：追加到打开中的聊天窗或刷新未读。"""
+        if not isinstance(message, DirectMessage):
+            return
+        overlay = self._private_chat_overlay
+        if (
+            overlay is not None
+            and message.sender_name == overlay.friend_nickname
+        ):
+            overlay.append_realtime(
+                {
+                    "id": message.id,
+                    "sender_id": message.sender_id,
+                    "sender_name": message.sender_name,
+                    "recipient_id": message.recipient_id,
+                    "content": message.content,
+                    "sent_at_ms": message.sent_at_ms,
+                }
+            )
+        if self._friends_overlay is not None and (
+            overlay is None
+            or message.sender_name != overlay.friend_nickname
+        ):
+            self._friends_overlay.refresh()
 
     def _open_invite_window(self) -> None:
         """自建房等待阶段打开好友邀请窗口。"""
@@ -1126,6 +1315,7 @@ class MainWindow(QMainWindow):
         self._game_generation += 1
         self._selected = None
         self._record_saved = False
+        self._clear_chat_log()
         self.stack.setCurrentWidget(self.game_page)
         self._set_game_shortcuts_enabled(True)
         self._sync_ui()
@@ -1391,6 +1581,159 @@ class MainWindow(QMainWindow):
         ):
             self._invite_overlay.accept()
         self._sync_ui()
+
+    # ------------------------------------------------------------------
+    # 对局聊天
+    # ------------------------------------------------------------------
+    def _refresh_chat_controls(
+        self, online_mode: Optional[bool] = None
+    ) -> None:
+        """按当前会话状态启用/禁用聊天控件（不含发言冷却）。"""
+        if online_mode is None:
+            online_mode = isinstance(
+                self._session, OnlineGameSession
+            )
+        session = self._session if online_mode else None
+        available = bool(
+            isinstance(session, OnlineGameSession)
+            and session.chat_available
+        )
+        for widget in (
+            self.emoji_button,
+            self.preset_comment_button,
+            self.chat_input,
+            self.chat_send_button,
+        ):
+            widget.setEnabled(available)
+        self.chat_log_toggle_button.setEnabled(bool(online_mode))
+
+    def _on_emoji_picked(self, emoji: str) -> None:
+        session = self._session
+        if isinstance(session, OnlineGameSession):
+            session.send_emoji(emoji)
+
+    def _on_preset_comment_picked(self, text: str) -> None:
+        session = self._session
+        if isinstance(session, OnlineGameSession):
+            session.send_comment(text)
+
+    def _on_send_comment(self) -> None:
+        session = self._session
+        if not isinstance(session, OnlineGameSession):
+            return
+        text = self.chat_input.text().strip()
+        if not text:
+            return
+        if session.send_comment(text):
+            self.chat_input.clear()
+
+    def _on_chat_received(self, message: object) -> None:
+        """收到服务端广播的对局表情/评论：弹幕 + 对话日志。"""
+        is_self = self._chat_is_self(message)
+        kind = str(getattr(message, "kind", ""))
+        content = str(getattr(message, "content", ""))
+        if kind == CHAT_KIND_EMOJI:
+            self.danmaku_overlay.push_emoji(content, is_self)
+        else:
+            self.danmaku_overlay.push_text(content, is_self)
+        self.chat_log.append_message(message, is_self)
+        if not self._chat_log_expanded:
+            self._chat_unread += 1
+            self._update_chat_toggle_text()
+
+    def _chat_is_self(self, message: object) -> bool:
+        session = self._session
+        if not isinstance(session, OnlineGameSession):
+            return False
+        sender_id = str(getattr(message, "sender_id", ""))
+        if session.account_id is not None:
+            return sender_id == str(session.account_id)
+        return (
+            getattr(message, "sender_name", "")
+            == session.account_nickname
+        )
+
+    def _on_chat_failed(self, reason: str) -> None:
+        text = reason or "发言未发送"
+        self.chat_log.append_notice(f"（{text}）")
+        if not self._chat_log_expanded:
+            self._flash_chat_hint(text)
+
+    def _flash_chat_hint(self, text: str) -> None:
+        self.chat_input.setPlaceholderText(text)
+        QTimer.singleShot(3000, self._restore_chat_hint)
+
+    def _restore_chat_hint(self) -> None:
+        if not self._closing:
+            self.chat_input.setPlaceholderText(CHAT_INPUT_HINT)
+
+    def _on_chat_log_toggled(self, checked: bool) -> None:
+        self._apply_chat_log_visibility(checked)
+        self._save_chat_log_visible(checked)
+
+    def _apply_chat_log_visibility(self, visible: bool) -> None:
+        expanded = bool(visible)
+        self._chat_log_expanded = expanded
+        online = isinstance(self._session, OnlineGameSession)
+        self.chat_log.setVisible(expanded and online)
+        button = self.chat_log_toggle_button
+        button.blockSignals(True)
+        button.setChecked(expanded)
+        button.blockSignals(False)
+        if expanded:
+            self._chat_unread = 0
+        self._update_chat_toggle_text()
+        button.setToolTip(
+            "收起对话日志，让棋盘占满整行"
+            if expanded
+            else "展开对话日志，查看双方的发言"
+        )
+
+    def _update_chat_toggle_text(self) -> None:
+        button = self.chat_log_toggle_button
+        if self._chat_log_expanded:
+            button.setText("隐藏日志")
+        elif self._chat_unread > 0:
+            button.setText(f"对话日志 ({self._chat_unread})")
+        else:
+            button.setText("对话日志")
+
+    def _clear_chat_log(self) -> None:
+        self.chat_log.clear_log()
+        self.danmaku_overlay.clear()
+        self._chat_unread = 0
+        self._update_chat_toggle_text()
+
+    def _load_chat_log_visible(self) -> bool:
+        value = self._settings.value(
+            SETTINGS_CHAT_LOG_VISIBLE, False
+        )
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in (
+                "1", "true", "yes"
+            )
+        return False
+
+    def _save_chat_log_visible(self, visible: bool) -> None:
+        self._settings.setValue(
+            SETTINGS_CHAT_LOG_VISIBLE, bool(visible)
+        )
+        self._settings.sync()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 接口
+        """棋盘尺寸变化时让弹幕覆盖层随之铺满。"""
+        if (
+            obj is getattr(self, "board_widget", None)
+            and event.type() == QEvent.Type.Resize
+            and hasattr(self, "danmaku_overlay")
+        ):
+            self.danmaku_overlay.setGeometry(
+                self.board_widget.rect()
+            )
+            self.danmaku_overlay.raise_()
+        return super().eventFilter(obj, event)
 
     def _on_session_move_made(self) -> None:
         self._play_move_sound()
@@ -1866,6 +2209,11 @@ class MainWindow(QMainWindow):
         self.board_widget.set_flipped(
             online_mode and human_side is Side.BLACK
         )
+        self.chat_bar.setVisible(online_mode)
+        self.chat_log.setVisible(
+            online_mode and self._chat_log_expanded
+        )
+        self._refresh_chat_controls(online_mode)
         difficulty_label = (
             self._session.difficulty.label if ai_mode else ""
         )

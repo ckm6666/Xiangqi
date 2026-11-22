@@ -9,9 +9,16 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from server.app.main import create_app
+from xiangqi.shared.chat import (
+    CHAT_BURST,
+    CHAT_KIND_TEXT,
+    EMOJI_PRESETS,
+    CHAT_KIND_EMOJI,
+)
 from xiangqi.shared.protocol import (
     CLIENT_AUTH,
     CLIENT_CHALLENGE_RESPONSE,
+    CLIENT_CHAT,
     CLIENT_CREATE_ROOM,
     CLIENT_INVITE_FRIEND,
     CLIENT_JOIN_QUEUE,
@@ -23,6 +30,8 @@ from xiangqi.shared.protocol import (
     CLIENT_UNDO_RESPONSE,
     SERVER_AUTH_OK,
     SERVER_CHALLENGE,
+    SERVER_CHAT,
+    SERVER_DIRECT_MESSAGE,
     SERVER_ERROR,
     SERVER_GAME_STATE,
     SERVER_INVITE_RESULT,
@@ -487,6 +496,169 @@ class OnlineServerTests(unittest.TestCase):
         self.assertEqual(result["type"], SERVER_INVITE_RESULT)
         self.assertEqual(result["payload"]["status"], "error")
         self.assertIn("好友", result["payload"]["reason"])
+
+    # ------------------------------------------------------------------
+    # 聊天
+    # ------------------------------------------------------------------
+    def test_room_chat_broadcast_and_rate_limit(self) -> None:
+        host, guest, _, _, _, host_info, _ = self._open_pair()
+
+        host.send_json(
+            make_message(
+                CLIENT_CHAT,
+                {"kind": CHAT_KIND_TEXT, "content": "  好棋！ "},
+                request_id="chat-first",
+            )
+        )
+        host_message = receive(host)
+        guest_message = receive(guest)
+        self.assertEqual(host_message["type"], SERVER_CHAT)
+        self.assertEqual(guest_message["type"], SERVER_CHAT)
+        payload = host_message["payload"]
+        self.assertEqual(payload["content"], "好棋！")
+        self.assertEqual(payload["sender_name"], "红方棋友")
+        self.assertEqual(
+            payload["sender_id"], str(host_info["user_id"])
+        )
+
+        guest.send_json(
+            make_message(
+                CLIENT_CHAT,
+                {
+                    "kind": CHAT_KIND_EMOJI,
+                    "content": EMOJI_PRESETS[0],
+                },
+                request_id="chat-emoji",
+            )
+        )
+        self.assertEqual(receive(host)["type"], SERVER_CHAT)
+        self.assertEqual(receive(guest)["type"], SERVER_CHAT)
+
+        # 第一条“好棋”已经占用了 1 条额度，再发 CHAT_BURST - 1 条刚好用满。
+        for index in range(CHAT_BURST - 1):
+            host.send_json(
+                make_message(
+                    CLIENT_CHAT,
+                    {
+                        "kind": CHAT_KIND_TEXT,
+                        "content": f"快点{index}",
+                    },
+                    request_id=f"burst-{index}",
+                )
+            )
+            self.assertEqual(receive(host)["type"], SERVER_CHAT)
+            self.assertEqual(receive(guest)["type"], SERVER_CHAT)
+
+        host.send_json(
+            make_message(
+                CLIENT_CHAT,
+                {"kind": CHAT_KIND_TEXT, "content": "再来一条"},
+                request_id="burst-extra",
+            )
+        )
+        error = receive(host)
+        self.assertEqual(error["type"], SERVER_ERROR)
+        self.assertEqual(error["request_id"], "burst-extra")
+        self.assertIn("发言太快", error["payload"]["message"])
+
+    def test_chat_rejected_while_waiting_for_opponent(self) -> None:
+        host, _info = self._socket("等待房主")
+        create_room(host)
+        host.send_json(
+            make_message(
+                CLIENT_CHAT,
+                {"kind": CHAT_KIND_TEXT, "content": "有人吗？"},
+                request_id="waiting-chat",
+            )
+        )
+        error = receive(host)
+        self.assertEqual(error["type"], SERVER_ERROR)
+        self.assertEqual(error["request_id"], "waiting-chat")
+        self.assertIn("对手", error["payload"]["message"])
+
+    def test_friend_direct_messages_and_unread(self) -> None:
+        host, guest, host_headers, guest_headers = (
+            self._friend_sockets()
+        )
+
+        friends = self.client.get(
+            "/api/v1/profile/friends", headers=host_headers
+        ).json()["friends"]
+        self.assertEqual(len(friends), 1)
+        self.assertEqual(friends[0]["nickname"], "自建房乙")
+        self.assertTrue(friends[0]["online"])
+        self.assertEqual(friends[0]["unread"], 0)
+
+        sent = self.client.post(
+            "/api/v1/messages",
+            params={"nickname": "自建房乙"},
+            json={"content": "  你好  "},
+            headers=host_headers,
+        )
+        self.assertEqual(sent.status_code, 200, sent.text)
+        sent_data = sent.json()
+        self.assertEqual(sent_data["content"], "你好")
+        self.assertEqual(sent_data["sender_name"], "自建房甲")
+        self.assertTrue(sent_data["id"])
+
+        push = receive(guest)
+        self.assertEqual(push["type"], SERVER_DIRECT_MESSAGE)
+        self.assertEqual(push["payload"]["content"], "你好")
+        self.assertEqual(
+            push["payload"]["sender_name"], "自建房甲"
+        )
+
+        guest_friends = self.client.get(
+            "/api/v1/profile/friends", headers=guest_headers
+        ).json()["friends"]
+        by_name = {
+            item["nickname"]: item for item in guest_friends
+        }
+        self.assertEqual(by_name["自建房甲"]["unread"], 1)
+
+        history = self.client.get(
+            "/api/v1/messages",
+            params={"nickname": "自建房甲"},
+            headers=guest_headers,
+        )
+        self.assertEqual(history.status_code, 200, history.text)
+        messages = history.json()["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["content"], "你好")
+        self.assertEqual(
+            messages[0]["sender_name"], "自建房甲"
+        )
+
+        guest_friends = self.client.get(
+            "/api/v1/profile/friends", headers=guest_headers
+        ).json()["friends"]
+        by_name = {
+            item["nickname"]: item for item in guest_friends
+        }
+        self.assertEqual(by_name["自建房甲"]["unread"], 0)
+
+        reply = self.client.post(
+            "/api/v1/messages",
+            params={"nickname": "自建房甲"},
+            json={"content": "你也好"},
+            headers=guest_headers,
+        )
+        self.assertEqual(reply.status_code, 200, reply.text)
+        push = receive(host)
+        self.assertEqual(push["type"], SERVER_DIRECT_MESSAGE)
+        self.assertEqual(push["payload"]["content"], "你也好")
+
+        stranger = register(self.client, "陌生棋友")
+        stranger_headers = {
+            "Authorization": f"Bearer {stranger['token']}"
+        }
+        forbidden = self.client.post(
+            "/api/v1/messages",
+            params={"nickname": "自建房甲"},
+            json={"content": "你好"},
+            headers=stranger_headers,
+        )
+        self.assertEqual(forbidden.status_code, 403)
 
     # ------------------------------------------------------------------
     # 排位匹配

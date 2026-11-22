@@ -4,6 +4,7 @@
     * 昵称唯一（大小写不敏感），排位分、战绩、头像与好友持久化；
     * 注册/登录通过 REST 完成，返回一次性 Bearer 令牌；
     * WebSocket 首帧用令牌认证，之后以账号身份加入房间/排位；
+    * 好友私聊消息存入 direct_messages 表，支持历史与未读/已读；
     * 令牌保存在服务端内存，有效期 24 小时，服务端重启后需重新登录。
 
 这套实现面向本地/局域网娱乐，不是面向公网的生产级认证系统。
@@ -104,6 +105,18 @@ class User:
     current_streak: int = 0
     avatar: str = DEFAULT_AVATAR
     best_rating: int = DEFAULT_RATING
+
+
+@dataclass(frozen=True)
+class DirectMessage:
+    """一条已持久化的好友私聊消息。"""
+
+    id: int
+    sender_id: int
+    recipient_id: int
+    content: str
+    sent_at_ms: int
+    read_at: Optional[str] = None
 
 
 def validate_nickname(value: object) -> str:
@@ -250,6 +263,30 @@ class UserStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (from_id, to_id)
                 )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS direct_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sender_id INTEGER NOT NULL,
+                    recipient_id INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    sent_at_ms INTEGER NOT NULL,
+                    read_at TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_direct_messages_pair
+                ON direct_messages (sender_id, recipient_id, id)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_direct_messages_unread
+                ON direct_messages (recipient_id, read_at)
                 """
             )
             self._conn.commit()
@@ -633,6 +670,120 @@ class UserStore:
             tuple(self._row_to_user(row) for row in outgoing_rows),
         )
 
+    @staticmethod
+    def _row_to_direct_message(row: sqlite3.Row) -> DirectMessage:
+        return DirectMessage(
+            id=int(row["id"]),
+            sender_id=int(row["sender_id"]),
+            recipient_id=int(row["recipient_id"]),
+            content=str(row["content"]),
+            sent_at_ms=int(row["sent_at_ms"]),
+            read_at=(
+                str(row["read_at"])
+                if row["read_at"] is not None
+                else None
+            ),
+        )
+
+    def create_direct_message(
+        self,
+        sender_id: int,
+        recipient_id: int,
+        content: str,
+        sent_at_ms: int,
+    ) -> DirectMessage:
+        """保存一条好友私聊并返回带 id 的记录。"""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO direct_messages
+                    (sender_id, recipient_id, content, sent_at_ms)
+                VALUES (?, ?, ?, ?)
+                """,
+                (sender_id, recipient_id, content, int(sent_at_ms)),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                """
+                SELECT id, sender_id, recipient_id, content,
+                       sent_at_ms, read_at
+                FROM direct_messages WHERE id = ?
+                """,
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        if row is None:  # pragma: no cover - 插入后立即查询不应失败
+            raise UserStoreError("私聊保存失败")
+        return self._row_to_direct_message(row)
+
+    def list_direct_messages(
+        self,
+        user_id: int,
+        other_id: int,
+        limit: int = 50,
+    ) -> tuple[DirectMessage, ...]:
+        """返回两人最近的私聊，按时间从早到晚排列。"""
+        count = max(1, min(200, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, sender_id, recipient_id, content,
+                       sent_at_ms, read_at
+                FROM direct_messages
+                WHERE (sender_id = ? AND recipient_id = ?)
+                   OR (sender_id = ? AND recipient_id = ?)
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (user_id, other_id, other_id, user_id, count),
+            ).fetchall()
+        return tuple(
+            self._row_to_direct_message(row)
+            for row in reversed(rows)
+        )
+
+    def mark_direct_messages_read(
+        self,
+        user_id: int,
+        sender_id: int,
+        message_ids: list[int],
+    ) -> int:
+        """把发给 ``user_id`` 的指定消息标记为已读。"""
+        ids = [int(item) for item in message_ids if int(item) > 0]
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""
+                UPDATE direct_messages
+                SET read_at = datetime('now')
+                WHERE recipient_id = ?
+                  AND sender_id = ?
+                  AND read_at IS NULL
+                  AND id IN ({placeholders})
+                """,
+                (user_id, sender_id, *ids),
+            )
+            self._conn.commit()
+            return int(cursor.rowcount or 0)
+
+    def unread_counts(self, user_id: int) -> dict[int, int]:
+        """按发送者统计某用户收到的未读私聊数量。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT sender_id, COUNT(*) AS total
+                FROM direct_messages
+                WHERE recipient_id = ? AND read_at IS NULL
+                GROUP BY sender_id
+                """,
+                (user_id,),
+            ).fetchall()
+        return {
+            int(row["sender_id"]): int(row["total"])
+            for row in rows
+        }
+
     def search_users(
         self,
         query: str,
@@ -733,6 +884,7 @@ class AuthManager:
 
 __all__ = [
     "User",
+    "DirectMessage",
     "UserStore",
     "UserStoreError",
     "ValidationError",

@@ -36,8 +36,11 @@ from xiangqi.client.sessions import (  # noqa: E402
 )
 from xiangqi.shared.game_model import GameModel  # noqa: E402
 from xiangqi.shared.record import GameRecord  # noqa: E402
+from xiangqi.shared.social import DirectMessage  # noqa: E402
 from xiangqi.shared.protocol import (  # noqa: E402
     SERVER_AUTH_OK,
+    SERVER_CHAT,
+    SERVER_ERROR,
     SERVER_GAME_STATE,
     SERVER_INVITE_RESULT,
     SERVER_QUEUE_STATUS,
@@ -590,6 +593,88 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.board_widget._interaction_enabled)
         self.assertTrue(self.window.board_widget.is_animating)
 
+    def test_online_chat_and_log_toggle(self) -> None:
+        transport = self._enter_online_game()
+        self.window._apply_chat_log_visibility(False)
+        self.assertFalse(self.window.chat_bar.isHidden())
+        self.assertTrue(self.window.chat_input.isEnabled())
+        self.assertTrue(self.window.chat_send_button.isEnabled())
+
+        self.window.chat_input.setText("好棋！")
+        self.window.chat_send_button.click()
+        sent = transport.sent[-1]
+        self.assertEqual(sent["type"], "chat")
+        self.assertEqual(
+            sent["payload"],
+            {"kind": "text", "content": "好棋！"},
+        )
+        self.assertEqual(self.window.chat_input.text(), "")
+        request_id = sent["request_id"]
+
+        transport.server_send(
+            make_message(
+                SERVER_CHAT,
+                {
+                    "kind": "text",
+                    "content": "好棋！",
+                    "sender_id": "1",
+                    "sender_name": "甲",
+                    "sent_at_ms": 1,
+                },
+            )
+        )
+        transport.server_send(
+            make_message(
+                SERVER_CHAT,
+                {
+                    "kind": "emoji",
+                    "content": "\U0001F44D",
+                    "sender_id": "2",
+                    "sender_name": "乙",
+                    "sent_at_ms": 2,
+                },
+            )
+        )
+        self.assertEqual(self.window.chat_log.entry_count(), 2)
+        self.assertEqual(
+            self.window.danmaku_overlay.active_count(), 2
+        )
+        self.assertTrue(
+            any(
+                text.startswith("你：")
+                for text in self.window.chat_log.entry_texts()
+            )
+        )
+        self.assertEqual(
+            self.window.chat_log_toggle_button.text(),
+            "对话日志 (2)",
+        )
+
+        self.window.chat_log_toggle_button.click()
+        self.assertFalse(self.window.chat_log.isHidden())
+        self.assertEqual(
+            self.window.chat_log_toggle_button.text(), "隐藏日志"
+        )
+
+        transport.server_send(
+            make_message(
+                SERVER_ERROR,
+                {"message": "发言太快，请稍候"},
+                request_id=request_id,
+            )
+        )
+        self.assertTrue(
+            any(
+                "发言太快" in text
+                for text in self.window.chat_log.entry_texts()
+            )
+        )
+
+    def test_local_game_hides_chat_bar(self) -> None:
+        self.window.start_local_game()
+        self.assertTrue(self.window.chat_bar.isHidden())
+        self.assertTrue(self.window.chat_log.isHidden())
+
     def test_online_waiting_room(self) -> None:
         self.window.online_button.click()
         self.window.online_page.apply_auth("token", "甲", 1200)
@@ -962,6 +1047,69 @@ class MainWindowTests(unittest.TestCase):
             self.window._on_social_profile_requested("乙")
         self.assertEqual(calls, [None, "乙"])
 
+    def test_friend_chat_opens_nested_overlay(self) -> None:
+        self.window.online_page.apply_auth("token", "甲", 1200)
+        calls: list[tuple] = []
+
+        class FakeChatOverlay:
+            def __init__(
+                self,
+                api,
+                base_url,
+                token,
+                nickname,
+                self_nickname,
+                *,
+                avatar="default:1",
+                online=None,
+                parent=None,
+            ) -> None:
+                del api, base_url, token, parent
+                calls.append(
+                    (nickname, self_nickname, avatar, online)
+                )
+
+            def exec(self) -> int:
+                return 0
+
+            def deleteLater(self) -> None:
+                return None
+
+        with patch(
+            "xiangqi.client.main_window.PrivateChatOverlay",
+            FakeChatOverlay,
+        ):
+            self.window._on_friend_chat_requested(
+                "好友甲", "default:2", True
+            )
+        self.assertEqual(
+            calls, [("好友甲", "甲", "default:2", True)]
+        )
+        self.assertFalse(self.window._modal_dialog_open)
+
+    def test_direct_message_routes_to_open_chat(self) -> None:
+        appended: list[dict] = []
+
+        class FakeChatOverlay:
+            friend_nickname = "好友甲"
+
+            def append_realtime(self, payload: dict) -> None:
+                appended.append(payload)
+
+        self.window._private_chat_overlay = FakeChatOverlay()  # type: ignore[assignment]
+        self.window._on_direct_message_received(
+            DirectMessage(
+                id="5",
+                sender_id="2",
+                sender_name="好友甲",
+                recipient_id="1",
+                content="你好",
+                sent_at_ms=100,
+            )
+        )
+        self.assertEqual(len(appended), 1)
+        self.assertEqual(appended[0]["content"], "你好")
+
     def test_challenge_dialog_accept_and_decline(self) -> None:
         self.window.online_page.apply_auth("token", "甲", 1200)
         responses: list[tuple[str, bool]] = []
@@ -991,6 +1139,7 @@ class MainWindowTests(unittest.TestCase):
 
         class FakeOverlay(QObject):
             profile_requested = Signal(str)
+            chat_requested = Signal(str, str, bool)
 
             def __init__(self, *args, **kwargs) -> None:
                 del args, kwargs

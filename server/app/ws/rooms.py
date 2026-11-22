@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
@@ -21,9 +22,16 @@ from typing import Mapping, Optional
 from fastapi import WebSocket
 
 from server.app.users import DEFAULT_RATING, UserStore
+from xiangqi.shared.chat import (
+    CHAT_BURST,
+    CHAT_WINDOW_SECONDS,
+    normalize_chat_content,
+)
+from xiangqi.shared.errors import ProtocolError
 from xiangqi.shared.game_model import GameModel
 from xiangqi.shared.protocol import (
     CLIENT_CHALLENGE_RESPONSE,
+    CLIENT_CHAT,
     CLIENT_CREATE_ROOM,
     CLIENT_INVITE_FRIEND,
     CLIENT_JOIN_QUEUE,
@@ -36,6 +44,7 @@ from xiangqi.shared.protocol import (
     CLIENT_UNDO_RESPONSE,
     SERVER_CHALLENGE,
     SERVER_CHALLENGE_CANCELLED,
+    SERVER_CHAT,
     SERVER_ERROR,
     SERVER_GAME_STATE,
     SERVER_INVITE_RESULT,
@@ -127,6 +136,10 @@ class Room:
     rating_deltas: dict[Side, int] = field(default_factory=dict)
     version: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: 对局聊天专用锁：只串行化发言广播，不占用对局锁，避免聊天拖慢落子。
+    chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: 每个账号最近若干次发言的时间戳，用于服务端限流。
+    chat_sent_times: dict[int, list[float]] = field(default_factory=dict)
 
 
 def other_side(side: Side) -> Side:
@@ -203,6 +216,8 @@ class RoomManager:
                 await self.resign(conn)
             elif message_type == CLIENT_REMATCH:
                 await self.rematch(conn)
+            elif message_type == CLIENT_CHAT:
+                await self.send_chat(conn, payload, request_id)
             else:
                 raise RoomError(f"不支持的消息类型：{message_type}")
         except RoomError as exc:
@@ -860,6 +875,97 @@ class RoomManager:
             await self._broadcast_state(room)
 
     # ------------------------------------------------------------------
+    # 对局聊天
+    # ------------------------------------------------------------------
+    async def send_chat(
+        self,
+        conn: Connection,
+        payload: Mapping[str, object],
+        request_id: Optional[str] = None,
+    ) -> None:
+        """校验、限流后把表情/评论广播给房间内双方。"""
+        room = self._require_room(conn)
+        kind = payload.get("kind")
+        content = payload.get("content")
+        if not isinstance(kind, str) or not isinstance(content, str):
+            await self._send_error(
+                conn, "聊天内容非法", request_id
+            )
+            return
+        try:
+            normalized = normalize_chat_content(kind, content)
+        except ProtocolError as exc:
+            await self._send_error(conn, str(exc), request_id)
+            return
+
+        # 只使用聊天锁，绝不占用 room.lock：发言的网络写不能拖慢
+        # 落子写库与超时判定。
+        async with room.chat_lock:
+            side = conn.side
+            if (
+                side is None
+                or room.websockets.get(side) is not conn.websocket
+            ):
+                await self._send_error(
+                    conn, "你不在对局中", request_id
+                )
+                return
+            if room.status == ROOM_STATUS_WAITING:
+                await self._send_error(
+                    conn, "对手尚未加入，暂时无法发言", request_id
+                )
+                return
+
+            user_key = conn.user_id or 0
+            now = time.monotonic()
+            times = [
+                stamp
+                for stamp in room.chat_sent_times.get(user_key, [])
+                if now - stamp < CHAT_WINDOW_SECONDS
+            ]
+            if len(times) >= CHAT_BURST:
+                await self._send_error(
+                    conn, "发言太快，请稍候", request_id
+                )
+                return
+            times.append(now)
+            room.chat_sent_times[user_key] = times
+
+            message = make_message(
+                SERVER_CHAT,
+                {
+                    "kind": kind,
+                    "content": normalized,
+                    "sender_id": str(conn.user_id or ""),
+                    "sender_name": conn.name,
+                    "sent_at_ms": int(time.time() * 1000),
+                },
+            )
+            for side_item in (Side.RED, Side.BLACK):
+                await self._send_ws(
+                    room.websockets[side_item], message
+                )
+
+    # ------------------------------------------------------------------
+    # 在线状态与主动推送
+    # ------------------------------------------------------------------
+    def is_online(self, user_id: int) -> bool:
+        """该账号是否有任意一条在线 WebSocket 连接。"""
+        return bool(self.connections.get(user_id))
+
+    async def send_to_user(
+        self,
+        user_id: int,
+        message: Mapping[str, object],
+    ) -> int:
+        """向某账号的所有在线连接推送消息，返回成功发送的连接数。"""
+        sent = 0
+        for target in list(self.connections.get(user_id, [])):
+            await self._send_ws(target.websocket, message)
+            sent += 1
+        return sent
+
+    # ------------------------------------------------------------------
     # 快照与发送
     # ------------------------------------------------------------------
     def _snapshot(self, room: Room, side: Side) -> dict[str, object]:
@@ -941,10 +1047,19 @@ class RoomManager:
         except Exception:
             logger.warning("向客户端发送消息失败", exc_info=True)
 
-    async def _send_error(self, conn: Connection, message: str) -> None:
+    async def _send_error(
+        self,
+        conn: Connection,
+        message: str,
+        request_id: Optional[str] = None,
+    ) -> None:
         await self._send_ws(
             conn.websocket,
-            make_message(SERVER_ERROR, {"message": message}),
+            make_message(
+                SERVER_ERROR,
+                {"message": message},
+                request_id=request_id,
+            ),
         )
 
     async def _send_move_rejected(

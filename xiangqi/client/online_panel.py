@@ -64,6 +64,8 @@ class OnlinePanel(InkBackdrop):
     leaderboard_requested = Signal()
     challenge_received = Signal(str, str)
     challenge_cancelled = Signal(str, str)
+    #: 好友私聊实时推送（OnlineGameSession.direct_message 的转发）。
+    direct_message_received = Signal(object)
 
     def __init__(
         self,
@@ -89,6 +91,8 @@ class OnlinePanel(InkBackdrop):
         self._profile_info: dict = {}
         self._ws_url = ""
         self._pending_ws_url = ""
+        # 大厅监听连接与对局连接都会收到同一条私聊，按消息 id 去重。
+        self._seen_direct_ids: set[str] = set()
 
         self._auth_api = self._auth_factory(self)
         self._auth_api.authenticated.connect(self._on_authenticated)
@@ -620,6 +624,7 @@ class OnlinePanel(InkBackdrop):
                 message, current
             )
         )
+        session.direct_message.connect(self._on_direct_message)
         self._lobby_session = session
         session.connect_to(url)
 
@@ -763,10 +768,26 @@ class OnlinePanel(InkBackdrop):
                 message, current
             )
         )
+        session.direct_message.connect(self._on_direct_message)
         self._session = session
         self._sync_queue_controls()
         session.connect_to(url)
         return True
+
+    def _on_direct_message(self, message: object) -> None:
+        """把好友私聊实时推送转发给主窗口的聊天窗口。
+
+        同一账号可能同时有大厅监听与对局两条连接，服务端会向两条连接
+        都推送；这里按消息 id 去重，避免聊天窗显示两遍。
+        """
+        message_id = str(getattr(message, "id", ""))
+        if message_id:
+            if message_id in self._seen_direct_ids:
+                return
+            if len(self._seen_direct_ids) > 500:
+                self._seen_direct_ids.clear()
+            self._seen_direct_ids.add(message_id)
+        self.direct_message_received.emit(message)
 
     def _on_ready(self, session: OnlineGameSession) -> None:
         if session is not self._session:

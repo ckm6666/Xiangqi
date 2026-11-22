@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from server.app.api.deps import make_current_user
 from server.app.api.profile import profile_payload
@@ -49,9 +49,13 @@ def create_router(
 
     @router.get("/search")
     def search_players(
+        request: Request,
         q: str = "",
         user: User = Depends(current_user),
     ) -> dict[str, object]:
+        manager = getattr(
+            request.app.state, "room_manager", None
+        )
         rows: list[dict[str, object]] = []
         for player in users.search_users(
             q, limit=20, exclude_id=user.id
@@ -67,6 +71,10 @@ def create_router(
                     ).record_text,
                     "relationship": users.relationship(
                         user.id, player.id
+                    ),
+                    "online": bool(
+                        manager is not None
+                        and manager.is_online(player.id)
                     ),
                 }
             )

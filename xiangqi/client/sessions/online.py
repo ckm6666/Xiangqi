@@ -8,6 +8,8 @@ resign / rematch。悔棋与再战需要对手同意。
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from typing import Mapping, Optional
 
 from PySide6.QtCore import QObject, Signal
@@ -15,11 +17,17 @@ from PySide6.QtCore import QObject, Signal
 from xiangqi.client.board_view import BoardView
 from xiangqi.client.sessions.base import GameSession
 from xiangqi.client.transport import Transport
+from xiangqi.shared.chat import (
+    CHAT_INTERVAL_SECONDS,
+    build_chat_payload,
+    parse_chat_message,
+)
 from xiangqi.shared.errors import ProtocolError
 from xiangqi.shared.game_model import GameModel
 from xiangqi.shared.protocol import (
     CLIENT_AUTH,
     CLIENT_CHALLENGE_RESPONSE,
+    CLIENT_CHAT,
     CLIENT_CREATE_ROOM,
     CLIENT_INVITE_FRIEND,
     CLIENT_JOIN_QUEUE,
@@ -33,6 +41,8 @@ from xiangqi.shared.protocol import (
     SERVER_AUTH_OK,
     SERVER_CHALLENGE,
     SERVER_CHALLENGE_CANCELLED,
+    SERVER_CHAT,
+    SERVER_DIRECT_MESSAGE,
     SERVER_ERROR,
     SERVER_GAME_STATE,
     SERVER_INVITE_RESULT,
@@ -46,6 +56,10 @@ from xiangqi.shared.protocol import (
     deserialize_moves,
     make_message,
     parse_message,
+)
+from xiangqi.shared.social import (
+    SocialError,
+    parse_direct_message,
 )
 from xiangqi.shared.rules import (
     EndReason,
@@ -68,6 +82,9 @@ STATUS_PLAYING = "playing"
 STATUS_FINISHED = "finished"
 STATUS_DISCONNECTED = "disconnected"
 
+#: 已发出但尚未收到服务器错误回执的聊天请求保留时长。
+CHAT_REQUEST_TTL_SECONDS = 30.0
+
 
 class OnlineGameSession(GameSession):
     """一局联机对战。"""
@@ -81,6 +98,9 @@ class OnlineGameSession(GameSession):
     challenge_cancelled = Signal(str, str)
     invite_status = Signal(str)
     invite_result = Signal(bool, str)
+    chat_received = Signal(object)  # ChatMessage
+    chat_failed = Signal(str)  # 发言被拒/发送失败的中文提示
+    direct_message = Signal(object)  # DirectMessage
 
     def __init__(
         self,
@@ -101,6 +121,7 @@ class OnlineGameSession(GameSession):
         self._transport = transport
         self._token = token
         self._name = ""
+        self._user_id: Optional[int] = None
         self._account_rating = 1200
         self._authed = False
         self._action = action
@@ -133,6 +154,9 @@ class OnlineGameSession(GameSession):
         self._game_over_emitted = False
         self._request_counter = 0
         self._moves: tuple[Move, ...] = ()
+        self._last_chat_at: Optional[float] = None
+        # 已发出但尚未收到错误回执的发言请求，用于把发言错误精确归位。
+        self._pending_chat_ids: dict[str, float] = {}
 
         transport.connected.connect(self._on_connected)
         transport.disconnected.connect(self._on_disconnected)
@@ -213,6 +237,10 @@ class OnlineGameSession(GameSession):
     @property
     def account_nickname(self) -> str:
         return self._name
+
+    @property
+    def account_id(self) -> Optional[int]:
+        return self._user_id
 
     @property
     def account_rating(self) -> int:
@@ -308,6 +336,31 @@ class OnlineGameSession(GameSession):
             and self._undo_requester is None
         )
 
+    @property
+    def chat_available(self) -> bool:
+        """对局聊天输入是否可用（不含发言冷却）。"""
+        return (
+            self._ready
+            and self._connected
+            and not self._shutdown
+            and not self._paused
+            and self._authed
+            and self._status in (STATUS_PLAYING, STATUS_FINISHED)
+        )
+
+    @property
+    def can_send_chat(self) -> bool:
+        """当前是否可以真的发出这条消息（chat_available 且冷却已过）。"""
+        if not self.chat_available:
+            return False
+        now = time.monotonic()
+        if (
+            self._last_chat_at is not None
+            and now - self._last_chat_at < CHAT_INTERVAL_SECONDS
+        ):
+            return False
+        return True
+
     # ------------------------------------------------------------------
     # 意图
     # ------------------------------------------------------------------
@@ -375,6 +428,73 @@ class OnlineGameSession(GameSession):
         if self._status != STATUS_FINISHED or not self._connected:
             return False
         return self._send(CLIENT_REMATCH)
+
+    # ------------------------------------------------------------------
+    # 对局聊天
+    # ------------------------------------------------------------------
+    def send_emoji(self, emoji: str) -> bool:
+        """发送一个预设表情。"""
+        return self.send_chat("emoji", emoji)
+
+    def send_comment(self, text: str) -> bool:
+        """发送一条手动输入或预设的评论。"""
+        return self.send_chat("text", text)
+
+    def send_chat(self, kind: str, content: str) -> bool:
+        """发送表情或评论；失败时发出 chat_failed 并返回 False。"""
+        if not self.chat_available:
+            self.chat_failed.emit("当前不能发言")
+            return False
+        try:
+            payload = build_chat_payload(kind, content)
+        except ProtocolError as exc:
+            self.chat_failed.emit(str(exc))
+            return False
+
+        now = time.monotonic()
+        if (
+            self._last_chat_at is not None
+            and now - self._last_chat_at < CHAT_INTERVAL_SECONDS
+        ):
+            self.chat_failed.emit("发言太快，请稍候")
+            return False
+        self._last_chat_at = now
+
+        request_id = uuid.uuid4().hex
+        try:
+            message = make_message(
+                CLIENT_CHAT, payload, request_id=request_id
+            )
+        except ProtocolError as exc:
+            self.chat_failed.emit(str(exc))
+            return False
+        if not self._send_chat_message(message):
+            self.chat_failed.emit("网络发送失败，请检查连接")
+            return False
+        self._remember_chat_request(request_id)
+        return True
+
+    def _send_chat_message(
+        self, message: Mapping[str, object]
+    ) -> bool:
+        """发送聊天消息，但不触发对局的通用错误信号。"""
+        try:
+            self._transport.send_message(message)
+        except Exception:
+            logger.exception("发送聊天消息失败")
+            return False
+        return True
+
+    def _remember_chat_request(self, request_id: str) -> None:
+        now = time.monotonic()
+        stale = [
+            key
+            for key, stamp in self._pending_chat_ids.items()
+            if now - stamp > CHAT_REQUEST_TTL_SECONDS
+        ]
+        for key in stale:
+            self._pending_chat_ids.pop(key, None)
+        self._pending_chat_ids[request_id] = now
 
     def invite_friend(self, nickname: str) -> bool:
         """自建房房主邀请好友。"""
@@ -445,6 +565,11 @@ class OnlineGameSession(GameSession):
         if message_type == SERVER_AUTH_OK:
             self._authed = True
             self._name = str(payload.get("nickname", ""))
+            user_id = payload.get("user_id")
+            if isinstance(user_id, int) and not isinstance(
+                user_id, bool
+            ):
+                self._user_id = user_id
             self._account_rating = int(
                 payload.get("rating", 1200)
             )
@@ -505,11 +630,44 @@ class OnlineGameSession(GameSession):
                     False, reason or "好友暂时无法接受挑战"
                 )
             self.state_changed.emit()
+        elif message_type == SERVER_CHAT:
+            self._handle_chat(payload)
+        elif message_type == SERVER_DIRECT_MESSAGE:
+            self._handle_direct_message(payload)
         elif message_type == SERVER_ERROR:
+            reason = str(payload.get("message", "联机错误"))
+            chat_request = _request_id
+            if (
+                isinstance(chat_request, str)
+                and chat_request in self._pending_chat_ids
+            ):
+                self._pending_chat_ids.pop(chat_request, None)
+                self.chat_failed.emit(reason)
+                return
             self._awaiting_move = False
             self._awaiting_undo = False
-            self.error.emit(str(payload.get("message", "联机错误")))
+            self.error.emit(reason)
             self.state_changed.emit()
+
+    def _handle_chat(self, payload: Mapping[str, object]) -> None:
+        """解析服务端广播的表情/评论并转发给界面。"""
+        try:
+            message = parse_chat_message(payload)
+        except ProtocolError as exc:
+            logger.warning("丢弃非法聊天消息：%s", exc)
+            return
+        self.chat_received.emit(message)
+
+    def _handle_direct_message(
+        self, payload: Mapping[str, object]
+    ) -> None:
+        """解析服务端推送的好友私聊。"""
+        try:
+            message = parse_direct_message(payload)
+        except SocialError as exc:
+            logger.warning("丢弃非法私聊消息：%s", exc)
+            return
+        self.direct_message.emit(message)
 
     def _apply_game_state(self, payload: Mapping[str, object]) -> None:
         try:

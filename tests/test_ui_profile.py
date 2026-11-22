@@ -10,7 +10,7 @@ APP = ensure_qt_app()
 
 from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtGui import QColor, QImage  # noqa: E402
-from PySide6.QtWidgets import QLabel  # noqa: E402
+from PySide6.QtWidgets import QLabel, QPushButton  # noqa: E402
 
 from xiangqi.client.avatars import (  # noqa: E402
     encode_png_bytes,
@@ -394,6 +394,46 @@ class FriendsOverlayTests(unittest.TestCase):
         )
         self.overlay._avatar_buttons["好友甲"].click()
         self.assertEqual(requested, ["好友甲"])
+
+    def test_friend_chat_button_unread_and_presence(self) -> None:
+        events: list[tuple[str, str, bool]] = []
+        self.overlay.chat_requested.connect(
+            lambda nickname, avatar, online: events.append(
+                (nickname, avatar, online)
+            )
+        )
+        self.overlay._on_loaded(
+            {
+                "friends": [
+                    {
+                        "nickname": "好友甲",
+                        "rating": 1200,
+                        "title": "棋士",
+                        "avatar": "default:2",
+                        "online": True,
+                        "unread": 2,
+                    }
+                ],
+                "incoming": [],
+                "outgoing": [],
+            }
+        )
+        labels = {
+            label.text()
+            for label in self.overlay.findChildren(QLabel)
+        }
+        self.assertIn("● 在线", labels)
+        self.assertIn("2 条未读", labels)
+        chat_buttons = [
+            button
+            for button in self.overlay.findChildren(QPushButton)
+            if button.text() == "聊天"
+        ]
+        self.assertTrue(chat_buttons)
+        chat_buttons[0].click()
+        self.assertEqual(
+            events, [("好友甲", "default:2", True)]
+        )
 
     def test_search_players_and_open_profile(self) -> None:
         requested: list[str] = []
